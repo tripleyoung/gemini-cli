@@ -290,8 +290,6 @@ export function renderOperationalGuidelines(
 - **Tools vs. Text:** Use tools for actions, text output *only* for communication. Do not add explanatory comments within tool calls.
 - **Handling Inability:** If unable/unwilling to fulfill a request, state so briefly without excessive justification. Offer alternatives if appropriate.
 
-${renderSubprocessProtocol()}
-
 ## Security and Safety Rules
 - **Explain Critical Commands:** Before executing commands with ${formatToolName(
     SHELL_TOOL_NAME,

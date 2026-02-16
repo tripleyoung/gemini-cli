@@ -410,20 +410,16 @@ export function getShellToolDescription(
       - Pagination: Always disable terminal pagination to ensure commands terminate (e.g., use \`git --no-pager\`, \`systemctl --no-pager\`, or set \`PAGER=cat\`).`
     : '';
 
-  const returnedInfo = `
-
-      The following information is returned: [Protocol: Subprocess]`;
-
   if (os.platform() === 'win32') {
     const backgroundInstructions = enableInteractiveShell
       ? 'To run a command in the background, set the `is_background` parameter to true. Do NOT use PowerShell background constructs.'
       : 'Command can start background processes using PowerShell constructs such as `Start-Process -NoNewWindow` or `Start-Job`.';
-    return `This tool executes a given shell command as \`powershell.exe -NoProfile -Command <command>\`. ${backgroundInstructions}${efficiencyGuidelines}${returnedInfo}`;
+    return `This tool executes a given shell command as \`powershell.exe -NoProfile -Command <command>\`. ${backgroundInstructions}${efficiencyGuidelines}`;
   } else {
     const backgroundInstructions = enableInteractiveShell
       ? 'To run a command in the background, set the `is_background` parameter to true. Do NOT use `&` to background commands.'
       : 'Command can start background processes using `&`.';
-    return `This tool executes a given shell command as \`bash -c <command>\`. ${backgroundInstructions}${efficiencyGuidelines}${returnedInfo}`;
+    return `This tool executes a given shell command as \`bash -c <command>\`. ${backgroundInstructions}${efficiencyGuidelines}`;
   }
 }
 
