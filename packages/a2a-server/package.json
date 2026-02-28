@@ -25,7 +25,7 @@
     "dist"
   ],
   "dependencies": {
-    "@a2a-js/sdk": "^0.3.8",
+    "@a2a-js/sdk": "file:../../a2a-js",
     "@google-cloud/storage": "^7.16.0",
     "@google/gemini-cli-core": "file:../core",
     "@google/genai": "^1.42.0",
