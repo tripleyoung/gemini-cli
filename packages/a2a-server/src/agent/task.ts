@@ -30,8 +30,7 @@ import {
   EDIT_TOOL_NAMES,
   processRestorableToolCalls,
 } from '@google/gemini-cli-core';
-import type { RequestContext } from '@a2a-js/sdk/server';
-import { type ExecutionEventBus } from '@a2a-js/sdk/server';
+import type { RequestContext , type ExecutionEventBus } from '@a2a-js/sdk/server';
 import type {
   TaskStatusUpdateEvent,
   TaskArtifactUpdateEvent,
@@ -324,9 +323,9 @@ export class Task {
 
     logger.info(
       '[Task] Scheduler output update for tool call ' +
-      toolCallId +
-      ': ' +
-      outputAsText,
+        toolCallId +
+        ': ' +
+        outputAsText,
     );
     const artifact: Artifact = {
       artifactId: `tool-${toolCallId}-output`,
@@ -412,8 +411,8 @@ export class Task {
     ) {
       logger.info(
         '[Task] ' +
-        (this.autoExecute ? '' : 'YOLO mode enabled. ') +
-        'Auto-approving all tool calls.',
+          (this.autoExecute ? '' : 'YOLO mode enabled. ') +
+          'Auto-approving all tool calls.',
       );
       toolCalls.forEach((tc: ToolCall) => {
         if (tc.status === 'awaiting_approval' && tc.confirmationDetails) {
@@ -835,9 +834,9 @@ export class Task {
         if (confirmationDetails.type === 'edit') {
           const payload = part.data['newContent']
             ? ({
-              // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-              newContent: part.data['newContent'] as string,
-            } as ToolConfirmationPayload)
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+                newContent: part.data['newContent'] as string,
+              } as ToolConfirmationPayload)
             : undefined;
           this.skipFinalTrueAfterInlineEdit = !!payload;
           try {
@@ -932,7 +931,7 @@ export class Task {
     aborted: AbortSignal,
   ): AsyncGenerator<ServerGeminiStreamEvent> {
     if (completedToolCalls.length === 0) {
-      yield* (async function* () { })(); // Yield nothing
+      yield* (async function* () {})(); // Yield nothing
       return;
     }
 
@@ -984,7 +983,9 @@ export class Task {
         continue;
       }
 
-      if (part.kind === 'text') {
+      // A2A v1: member-name discriminator (text property presence)
+      // Also supports v0.3 legacy: kind === 'text'
+      if (part.kind === 'text' || ('text' in part && part.text && !part.kind)) {
         llmParts.push({ text: part.text });
         hasContentForLlm = true;
       }
@@ -1022,7 +1023,7 @@ export class Task {
         };
         this.setTaskStateAndPublishUpdate('working', stateChange); // Reflect potential background activity
       }
-      yield* (async function* () { })(); // Yield nothing
+      yield* (async function* () {})(); // Yield nothing
     } else {
       logger.info(
         '[Task] No relevant parts in user message for LLM interaction or tool confirmation.',
@@ -1030,7 +1031,7 @@ export class Task {
       // If there's no new text and no confirmations, and no pending tools,
       // it implies we might need to signal input required if nothing else is happening.
       // However, the agent.ts will make this determination after waitForPendingTools.
-      yield* (async function* () { })(); // Yield nothing
+      yield* (async function* () {})(); // Yield nothing
     }
   }
 
