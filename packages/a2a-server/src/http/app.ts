@@ -92,7 +92,7 @@ const coderAgentCard: AgentCard = {
       outputModes: ['text'],
     },
   ],
-  supportsAuthenticatedExtendedCard: a2aAuthEnabled,
+  supportsAuthenticatedExtendedCard: true,
 };
 
 export function updateCoderAgentCardUrl(port: number) {
