@@ -55,6 +55,9 @@ export interface ToolCallConfirmation {
 
 export interface ToolCallUpdate {
   kind: CoderAgentEvent.ToolCallUpdateEvent;
+  toolName?: string;
+  toolCallId?: string;
+  status?: 'started' | 'completed' | 'failed';
 }
 
 export interface TextContent {

@@ -24,6 +24,7 @@ import type {
   StateChange,
   AgentSettings,
   PersistedStateMetadata,
+  ToolCallUpdate,
 } from '../types.js';
 import {
   CoderAgentEvent,
@@ -497,6 +498,18 @@ export class CoderAgentExecutor implements AgentExecutor {
           logger.info(
             `[CoderAgentExecutor] Task ${taskId}: Found ${toolCallRequests.length} tool call requests. Scheduling as a batch.`,
           );
+
+          // Publish tool-call-update events for each tool call (started)
+          for (const req of toolCallRequests) {
+            const toolUpdate: ToolCallUpdate = {
+              kind: CoderAgentEvent.ToolCallUpdateEvent,
+              toolName: req.name,
+              toolCallId: req.callId,
+              status: 'started',
+            };
+            currentTask.setTaskStateAndPublishUpdate('working', toolUpdate);
+          }
+
           await currentTask.scheduleToolCalls(toolCallRequests, abortSignal);
         }
 
@@ -513,6 +526,17 @@ export class CoderAgentExecutor implements AgentExecutor {
         const completedTools = currentTask.getAndClearCompletedTools();
 
         if (completedTools.length > 0) {
+          // Publish tool-call-update events for each completed tool
+          for (const tool of completedTools) {
+            const toolUpdate: ToolCallUpdate = {
+              kind: CoderAgentEvent.ToolCallUpdateEvent,
+              toolName: tool.request.name,
+              toolCallId: tool.request.callId,
+              status: tool.status === 'cancelled' ? 'failed' : 'completed',
+            };
+            currentTask.setTaskStateAndPublishUpdate('working', toolUpdate);
+          }
+
           // If all completed tool calls were canceled, manually add them to history and set state to input-required, final:true
           if (completedTools.every((tool) => tool.status === 'cancelled')) {
             logger.info(
