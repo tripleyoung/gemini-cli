@@ -58,6 +58,7 @@ export interface ToolCallUpdate {
   toolName?: string;
   toolCallId?: string;
   status?: 'started' | 'completed' | 'failed';
+  responseText?: string;
 }
 
 export interface TextContent {

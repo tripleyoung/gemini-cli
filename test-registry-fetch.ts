@@ -8,9 +8,9 @@ async function run() {
     process.env.CODER_AGENT_WORKSPACE_PATH = process.cwd();
 
     // We want to see if the registry successfully fetches the agent-card for 'researcher'
-    const mockAgentFile = `${process.env.HOME}/.ilhae/team-workspaces/leader/.gemini/agents/researcher.md`;
-    console.log(`Setting up to load mock workspace: ${process.env.HOME}/.ilhae/team-workspaces/leader`);
-    process.env.GEMINI_CLI_HOME = `${process.env.HOME}/.ilhae/team-workspaces/leader`;
+    const mockAgentFile = `${process.env.HOME}/ilhae/team-workspaces/leader/.gemini/agents/researcher.md`;
+    console.log(`Setting up to load mock workspace: ${process.env.HOME}/ilhae/team-workspaces/leader`);
+    process.env.GEMINI_CLI_HOME = `${process.env.HOME}/ilhae/team-workspaces/leader`;
 
     const config = await Config.getInstance();
     await config.initialize();

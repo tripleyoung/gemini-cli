@@ -680,6 +680,56 @@ Describe how the agent should use this skill here.
           return { success: false, error: String(e) };
         }
       }
+      case '_agent/skill/export': {
+        const skillName = params['name'] as string | undefined;
+        if (!skillName) return { success: false, error: 'Missing name param' };
+        try {
+          const { Storage } = await import('@google/gemini-cli-core');
+          const path = await import('path');
+          const fs = await import('fs/promises');
+          const os = await import('os');
+
+          // Search in multiple skill locations
+          const searchDirs = [
+            path.join(Storage.getGlobalAgentsDir() || path.join(os.homedir(), '.agents'), 'skills'),
+            path.join(Storage.getGlobalGeminiDir(), 'skills'),
+          ];
+
+          let skillDir: string | null = null;
+          for (const dir of searchDirs) {
+            const candidate = path.join(dir, skillName);
+            try {
+              await fs.access(candidate);
+              skillDir = candidate;
+              break;
+            } catch { /* not found, try next */ }
+          }
+
+          if (!skillDir) {
+            return { success: false, error: `Skill '${skillName}' not found` };
+          }
+
+          // Read all files in the skill directory
+          const files: Record<string, string> = {};
+          const entries = await fs.readdir(skillDir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.isFile()) {
+              const content = await fs.readFile(path.join(skillDir, entry.name), 'utf8');
+              files[entry.name] = content;
+            }
+          }
+
+          return {
+            success: true,
+            name: skillName,
+            files,
+            skillMd: files['SKILL.md'] || null,
+          };
+        } catch (e) {
+          debugLogger.error(`[ACP] Failed to export skill ${skillName}: ${e}`);
+          return { success: false, error: String(e) };
+        }
+      }
       case '_agent/mcp/delete': {
         const mcpName = params['name'] as string | undefined;
         if (!mcpName) return { success: false, error: 'Missing mcp name' };

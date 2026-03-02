@@ -475,6 +475,7 @@ export async function createApp() {
         'Connection': 'keep-alive',
       });
       res.write(': connected\n\n');
+      res.write('event: endpoint\ndata: /acp\n\n');
       sseClients.push(res);
 
       const keepAliveInterval = setInterval(() => {

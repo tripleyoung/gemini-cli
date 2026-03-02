@@ -30,7 +30,7 @@ import {
   EDIT_TOOL_NAMES,
   processRestorableToolCalls,
 } from '@google/gemini-cli-core';
-import type { RequestContext , type ExecutionEventBus } from '@a2a-js/sdk/server';
+import type { RequestContext , ExecutionEventBus } from '@a2a-js/sdk/server';
 import type {
   TaskStatusUpdateEvent,
   TaskArtifactUpdateEvent,
@@ -389,10 +389,61 @@ export class Task {
 
       // Only send an update if the status has actually changed.
       if (hasChanged) {
-        const coderAgentMessage: CoderAgentMessage =
-          tc.status === 'awaiting_approval'
-            ? { kind: CoderAgentEvent.ToolCallConfirmationEvent }
-            : { kind: CoderAgentEvent.ToolCallUpdateEvent };
+        let coderAgentMessage: CoderAgentMessage;
+        if (tc.status === 'awaiting_approval') {
+          coderAgentMessage = { kind: CoderAgentEvent.ToolCallConfirmationEvent };
+        } else {
+          // Build ToolCallUpdate with toolName, status, and responseText
+          const toolCallUpdate: ToolCallUpdate = {
+            kind: CoderAgentEvent.ToolCallUpdateEvent,
+            toolName: tc.request.name,
+            toolCallId: tc.request.callId,
+            status:
+              tc.status === 'success'
+                ? 'completed'
+                : tc.status === 'cancelled'
+                  ? 'failed'
+                  : tc.status === 'error'
+                    ? 'failed'
+                    : 'started',
+          };
+          // Extract responseText for completed tool calls
+          if (tc.status === 'success' && tc.response) {
+            let responseText = '';
+            // Try resultDisplay first
+            if (tc.response.resultDisplay) {
+              responseText = String(tc.response.resultDisplay);
+            }
+            // Fallback: extract from responseParts
+            if (!responseText && tc.response.responseParts) {
+              for (const p of tc.response.responseParts) {
+                if ('text' in p && typeof p.text === 'string') {
+                  responseText += p.text;
+                } else {
+                  const pAny = p as Record<string, unknown>;
+                  if (pAny['functionResponse']) {
+                    const fr = pAny['functionResponse'] as Record<string, unknown>;
+                    const frResp = fr['response'] as Record<string, unknown> | undefined;
+                    if (frResp && typeof frResp['output'] === 'string') {
+                      responseText += frResp['output'] as string;
+                    }
+                  }
+                }
+              }
+            }
+            // Fallback: data payload
+            if (!responseText && tc.response.data) {
+              const output = tc.response.data['output'];
+              if (typeof output === 'string') {
+                responseText = output;
+              }
+            }
+            if (responseText) {
+              toolCallUpdate.responseText = responseText;
+            }
+          }
+          coderAgentMessage = toolCallUpdate;
+        }
         const message = this.toolStatusMessage(tc, this.id, this.contextId);
 
         const event = this._createStatusUpdateEvent(

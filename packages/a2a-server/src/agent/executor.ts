@@ -526,13 +526,45 @@ export class CoderAgentExecutor implements AgentExecutor {
         const completedTools = currentTask.getAndClearCompletedTools();
 
         if (completedTools.length > 0) {
-          // Publish tool-call-update events for each completed tool
+          // Note: _schedulerToolCallsUpdate in task.ts now handles
+          // publishing tool-call-update SSE events with toolName/status/responseText.
+          // This loop is only reached via _schedulerAllToolCallsComplete path
+          // (batch completions). Publish here as well for completeness.
           for (const tool of completedTools) {
+            let responseText = '';
+            if ('response' in tool && tool.response) {
+              if (tool.response.resultDisplay) {
+                responseText = String(tool.response.resultDisplay);
+              }
+              if (!responseText && tool.response.responseParts) {
+                for (const p of tool.response.responseParts) {
+                  if ('text' in p && typeof p.text === 'string') {
+                    responseText += p.text;
+                  } else {
+                    const pAny = p as Record<string, unknown>;
+                    if (pAny['functionResponse']) {
+                      const fr = pAny['functionResponse'] as Record<string, unknown>;
+                      const frResp = fr['response'] as Record<string, unknown> | undefined;
+                      if (frResp && typeof frResp['output'] === 'string') {
+                        responseText += frResp['output'] as string;
+                      }
+                    }
+                  }
+                }
+              }
+              if (!responseText && tool.response.data) {
+                const output = tool.response.data['output'];
+                if (typeof output === 'string') {
+                  responseText = output;
+                }
+              }
+            }
             const toolUpdate: ToolCallUpdate = {
               kind: CoderAgentEvent.ToolCallUpdateEvent,
               toolName: tool.request.name,
               toolCallId: tool.request.callId,
               status: tool.status === 'cancelled' ? 'failed' : 'completed',
+              responseText: responseText || undefined,
             };
             currentTask.setTaskStateAndPublishUpdate('working', toolUpdate);
           }
