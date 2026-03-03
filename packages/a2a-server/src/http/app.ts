@@ -72,6 +72,14 @@ const coderAgentCard: AgentCard = {
     streaming: true,
     pushNotifications: true,
     stateTransitionHistory: true,
+    extensions: [
+      {
+        uri: 'urn:google:a2a:ext:tool-call-reporting',
+        description:
+          'Reports tool call lifecycle events (started/completed/failed) via TaskStatusUpdateEvent metadata',
+        required: false,
+      },
+    ],
   },
   securitySchemes: a2aSecuritySchemes,
   security: a2aSecurityRequirements,

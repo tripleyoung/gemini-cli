@@ -6,7 +6,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { CoderAgentEvent, type AgentSettings } from '../types.js';
+import { CoderAgentEvent, CODER_AGENT_METADATA_KEY, type AgentSettings } from '../types.js';
 import { performInit } from '@google/gemini-cli-core';
 import type {
   Command,
@@ -59,7 +59,7 @@ export class InitCommand implements Command {
       },
       final: true,
       metadata: {
-        coderAgent: { kind: eventType },
+        [CODER_AGENT_METADATA_KEY]: { kind: eventType },
         model: context.config.getModel(),
       },
     };
@@ -108,7 +108,7 @@ export class InitCommand implements Command {
         taskId,
         contextId,
         metadata: {
-          coderAgent: agentSettings,
+          [CODER_AGENT_METADATA_KEY]: agentSettings,
         },
       },
       taskId,

@@ -43,7 +43,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../utils/logger.js';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { CoderAgentEvent } from '../types.js';
+import { CoderAgentEvent, CODER_AGENT_METADATA_KEY } from '../types.js';
 import type {
   CoderAgentMessage,
   StateChange,
@@ -235,23 +235,19 @@ export class Task {
     traceId?: string,
   ): TaskStatusUpdateEvent {
     const metadata: {
-      coderAgent: CoderAgentMessage;
-      model: string;
-      userTier?: UserTierId;
-      error?: string;
-      traceId?: string;
+      [key: string]: CoderAgentMessage | string | UserTierId | undefined;
     } = {
-      coderAgent: coderAgentMessage,
+      [CODER_AGENT_METADATA_KEY]: coderAgentMessage,
       model: this.modelInfo || this.config.getModel(),
       userTier: this.config.getUserTier(),
     };
 
     if (metadataError) {
-      metadata.error = metadataError;
+      metadata['error'] = metadataError;
     }
 
     if (traceId) {
-      metadata.traceId = traceId;
+      metadata['traceId'] = traceId;
     }
 
     return {

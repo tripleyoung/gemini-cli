@@ -12,6 +12,17 @@ import type { TaskState } from '@a2a-js/sdk';
 
 // Interfaces and enums for the CoderAgent protocol.
 
+/**
+ * A2A AgentExtension URI for tool call reporting.
+ * Per A2A spec, extensions are identified by unique URIs registered
+ * in AgentCard.capabilities.extensions.
+ */
+export const TOOL_CALL_REPORTING_EXT_URI =
+  'urn:google:a2a:ext:tool-call-reporting';
+
+/** Metadata key used in TaskStatusUpdateEvent.metadata */
+export const CODER_AGENT_METADATA_KEY = TOOL_CALL_REPORTING_EXT_URI;
+
 export enum CoderAgentEvent {
   /**
    * An event requesting one or more tool call confirmations.

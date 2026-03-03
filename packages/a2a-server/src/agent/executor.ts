@@ -28,6 +28,7 @@ import type {
 } from '../types.js';
 import {
   CoderAgentEvent,
+  CODER_AGENT_METADATA_KEY,
   getPersistedState,
   setPersistedState,
 } from '../types.js';
@@ -383,7 +384,7 @@ export class CoderAgentExecutor implements AgentExecutor {
             } as Message,
           },
           final: true,
-          metadata: { coderAgent: stateChange },
+          metadata: { [CODER_AGENT_METADATA_KEY]: stateChange },
         });
         return;
       }
@@ -391,7 +392,7 @@ export class CoderAgentExecutor implements AgentExecutor {
       logger.info(`[CoderAgentExecutor] Creating new task ${taskId}.`);
       // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       const agentSettings = userMessage.metadata?.[
-        'coderAgent'
+        CODER_AGENT_METADATA_KEY
       ] as AgentSettings;
       try {
         wrapper = await this.createTask(
