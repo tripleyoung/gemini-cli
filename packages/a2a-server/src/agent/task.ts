@@ -403,10 +403,8 @@ export class Task {
                     ? 'failed'
                     : 'started',
           };
-          // Include rawInput (tool arguments) for display
-          if (tc.request.args && Object.keys(tc.request.args).length > 0) {
-            toolCallUpdate.rawInput = tc.request.args;
-          }
+          // Always include rawInput (tool arguments) for display
+          toolCallUpdate.rawInput = tc.request.args ?? {};
           // Extract responseText for completed tool calls
           if (tc.status === 'success' && tc.response) {
             let responseText = '';
