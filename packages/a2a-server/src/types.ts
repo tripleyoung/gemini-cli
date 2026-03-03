@@ -69,6 +69,7 @@ export interface ToolCallUpdate {
   toolName?: string;
   toolCallId?: string;
   status?: 'started' | 'completed' | 'failed';
+  rawInput?: Record<string, unknown>;
   responseText?: string;
 }
 
