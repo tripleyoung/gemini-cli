@@ -106,6 +106,11 @@ export async function loadConfig(
     enableInteractiveShell: true,
     enableAgents: true, // Enable user/project agent discovery (peer agents in team mode)
     ptyInfo: 'auto',
+    // Allow additional workspace directories via environment variable
+    // (e.g., brain dir for artifact storage, passed by ilhae-proxy spawn)
+    includeDirectories: process.env['CODER_AGENT_INCLUDE_DIRS']
+      ? process.env['CODER_AGENT_INCLUDE_DIRS'].split(path.delimiter).filter(Boolean)
+      : undefined,
   };
 
   const fileService = new FileDiscoveryService(workspaceDir, {
