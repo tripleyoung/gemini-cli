@@ -68,7 +68,10 @@ import { ideContextStore } from '../ide/ideContext.js';
 import { WriteTodosTool } from '../tools/write-todos.js';
 import type { FileSystemService } from '../services/fileSystemService.js';
 import { StandardFileSystemService } from '../services/fileSystemService.js';
-import { logRipgrepFallback, logFlashFallback } from '../telemetry/loggers.js';
+import { logRipgrepFallback, logFlashFallback ,
+  logApprovalModeSwitch,
+  logApprovalModeDuration,
+} from '../telemetry/loggers.js';
 import {
   RipgrepFallbackEvent,
   FlashFallbackEvent,
@@ -103,9 +106,7 @@ import type { EventEmitter } from 'node:events';
 import { PolicyEngine } from '../policy/policy-engine.js';
 import { ApprovalMode, type PolicyEngineConfig } from '../policy/types.js';
 import { HookSystem } from '../hooks/index.js';
-import type { UserTierId } from '../code_assist/types.js';
-import type { RetrieveUserQuotaResponse } from '../code_assist/types.js';
-import type { AdminControlsSettings } from '../code_assist/types.js';
+import type { UserTierId , RetrieveUserQuotaResponse , AdminControlsSettings } from '../code_assist/types.js';
 import type { HierarchicalMemory } from './memory.js';
 import { getCodeAssistServer } from '../code_assist/codeAssist.js';
 import type { Experiments } from '../code_assist/experiments/experiments.js';
@@ -119,10 +120,6 @@ import { debugLogger } from '../utils/debugLogger.js';
 import { SkillManager, type SkillDefinition } from '../skills/skillManager.js';
 import { startupProfiler } from '../telemetry/startupProfiler.js';
 import type { AgentDefinition } from '../agents/types.js';
-import {
-  logApprovalModeSwitch,
-  logApprovalModeDuration,
-} from '../telemetry/loggers.js';
 import { fetchAdminControls } from '../code_assist/admin/admin_controls.js';
 import { isSubpath } from '../utils/paths.js';
 import { UserHintService } from './userHintService.js';
@@ -355,7 +352,7 @@ export class MCPServerConfig {
     readonly targetAudience?: string,
     /* targetServiceAccount format: <service-account-name>@<project-num>.iam.gserviceaccount.com */
     readonly targetServiceAccount?: string,
-  ) { }
+  ) {}
 }
 
 export enum AuthProviderType {
@@ -679,10 +676,10 @@ export class Config {
   private readonly onModelChange: ((model: string) => void) | undefined;
   private readonly onReload:
     | (() => Promise<{
-      disabledSkills?: string[];
-      adminSkillsEnabled?: boolean;
-      agents?: AgentSettings;
-    }>)
+        disabledSkills?: string[];
+        adminSkillsEnabled?: boolean;
+        agents?: AgentSettings;
+      }>)
     | undefined;
 
   private readonly enableAgents: boolean;
@@ -1526,10 +1523,10 @@ export class Config {
 
   getRemainingQuotaForModel(modelId: string):
     | {
-      remainingAmount?: number;
-      remainingFraction?: number;
-      resetTime?: string;
-    }
+        remainingAmount?: number;
+        remainingFraction?: number;
+        resetTime?: string;
+      }
     | undefined {
     const bucket = this.lastRetrievedQuota?.buckets?.find(
       (b) => b.modelId === modelId,
@@ -2179,7 +2176,14 @@ export class Config {
     const projectTempDir = this.storage.getProjectTempDir();
     const resolvedTempDir = realpath(projectTempDir);
 
-    return isSubpath(resolvedTempDir, resolvedPath);
+    if (isSubpath(resolvedTempDir, resolvedPath)) {
+      return true;
+    }
+
+    // Allow writes to the ilhae data directory (~/ilhae) for brain artifacts
+    const homeDir = os.homedir();
+    const ilhaeDataDir = realpath(path.join(homeDir, 'ilhae'));
+    return isSubpath(ilhaeDataDir, resolvedPath);
   }
 
   /**
@@ -2436,7 +2440,7 @@ export class Config {
     return Math.min(
       // Estimate remaining context window in characters (1 token ~= 4 chars).
       4 *
-      (tokenLimit(this.model) - uiTelemetryService.getLastPromptTokenCount()),
+        (tokenLimit(this.model) - uiTelemetryService.getLastPromptTokenCount()),
       this.truncateToolOutputThreshold,
     );
   }
@@ -2619,8 +2623,15 @@ export class Config {
           // For A2A remote agents, expose parallel copies to bypass LLM duplicate call limits
           if (definition.kind === 'remote') {
             for (let i = 1; i <= 3; i++) {
-              const cloneDef = { ...definition, name: `${definition.name}_${i}` };
-              const cloneTool = new SubagentTool(cloneDef, this, this.getMessageBus());
+              const cloneDef = {
+                ...definition,
+                name: `${definition.name}_${i}`,
+              };
+              const cloneTool = new SubagentTool(
+                cloneDef,
+                this,
+                this.getMessageBus(),
+              );
               registry.registerTool(cloneTool);
             }
           }
