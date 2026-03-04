@@ -78,7 +78,8 @@
     "minimatch": "^10.2.2"
   },
   "bin": {
-    "gemini-ilhae": "bundle/gemini.js"
+    "gemini-ilhae": "bundle/gemini.js",
+    "gemini-ilhae-a2a-server": "packages/a2a-server/dist/a2a-server.mjs"
   },
   "files": [
     "bundle/",
