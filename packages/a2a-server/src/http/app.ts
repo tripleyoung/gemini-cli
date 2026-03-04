@@ -246,7 +246,8 @@ export async function createApp() {
       logger.info('[CoreAgent] Reloading agent registry...');
       const agentRegistry = config.getAgentRegistry();
       await agentRegistry.reload();
-      config.refreshSubAgentTools();
+      // Note: agentRegistry.reload() emits CoreEvent.AgentsRefreshed,
+      // which Config.onAgentsRefreshed handles to re-register sub-agent tools.
       const agents = agentRegistry.getAllDefinitions();
       const agentNames = agents.map((a) => a.name);
 
