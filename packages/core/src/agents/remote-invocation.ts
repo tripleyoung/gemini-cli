@@ -4,29 +4,29 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { ToolConfirmationOutcome } from '../tools/tools.js';
 import {
   BaseToolInvocation,
+  type ToolConfirmationOutcome,
   type ToolResult,
   type ToolCallConfirmationDetails,
 } from '../tools/tools.js';
-import { DEFAULT_QUERY_STRING } from './types.js';
-import type {
-  RemoteAgentInputs,
-  RemoteAgentDefinition,
-  AgentInputs,
+import {
+  DEFAULT_QUERY_STRING,
+  type RemoteAgentInputs,
+  type RemoteAgentDefinition,
+  type AgentInputs,
 } from './types.js';
 import type { MessageBus } from '../confirmation-bus/message-bus.js';
-import { A2AClientManager } from './a2a-client-manager.js';
-import { v4 as uuidv4 } from 'uuid';
 import {
-  extractMessageText,
-  extractTaskText,
-  extractIdsFromResponse,
-} from './a2aUtils.js';
+  A2AClientManager,
+  type SendMessageResult,
+} from './a2a-client-manager.js';
+import { extractIdsFromResponse, A2AResultReassembler } from './a2aUtils.js';
 import { GoogleAuth } from 'google-auth-library';
 import type { AuthenticationHandler } from '@a2a-js/sdk/client';
 import { debugLogger } from '../utils/debugLogger.js';
+import type { AnsiOutput } from '../utils/terminalSerializer.js';
+import { A2AAuthProviderFactory } from './auth-provider/factory.js';
 
 /**
  * Authentication handler implementation using Google Application Default Credentials (ADC).
@@ -45,8 +45,9 @@ export class ADCHandler implements AuthenticationHandler {
       }
       throw new Error('Failed to retrieve ADC access token.');
     } catch (e) {
-      const errorMessage = `Failed to get ADC token: ${e instanceof Error ? e.message : String(e)
-        }`;
+      const errorMessage = `Failed to get ADC token: ${
+        e instanceof Error ? e.message : String(e)
+      }`;
       debugLogger.log('ERROR', errorMessage);
       throw new Error(errorMessage);
     }
@@ -81,7 +82,7 @@ export class RemoteAgentInvocation extends BaseToolInvocation<
   // TODO: See if we can reuse the singleton from AppContainer or similar, but for now use getInstance directly
   // as per the current pattern in the codebase.
   private readonly clientManager = A2AClientManager.getInstance();
-  private readonly authHandler = new ADCHandler();
+  private authHandler: AuthenticationHandler | undefined;
 
   constructor(
     private readonly definition: RemoteAgentDefinition,
@@ -98,12 +99,7 @@ export class RemoteAgentInvocation extends BaseToolInvocation<
     }
     // Safe to pass strict object to super
     super(
-      {
-        query,
-        async: typeof params['async'] === 'boolean' ? params['async'] : undefined,
-        subscribe: typeof params['subscribe'] === 'boolean' ? params['subscribe'] : undefined,
-        sessionId: typeof params['sessionId'] === 'string' ? params['sessionId'] : undefined
-      },
+      { query },
       messageBus,
       _toolName ?? definition.name,
       _toolDisplayName ?? definition.displayName,
@@ -112,6 +108,27 @@ export class RemoteAgentInvocation extends BaseToolInvocation<
 
   getDescription(): string {
     return `Calling remote agent ${this.definition.displayName ?? this.definition.name}`;
+  }
+
+  private async getAuthHandler(): Promise<AuthenticationHandler | undefined> {
+    if (this.authHandler) {
+      return this.authHandler;
+    }
+
+    if (this.definition.auth) {
+      const provider = await A2AAuthProviderFactory.create({
+        authConfig: this.definition.auth,
+        agentName: this.definition.name,
+      });
+      if (!provider) {
+        throw new Error(
+          `Failed to create auth provider for agent '${this.definition.name}'`,
+        );
+      }
+      this.authHandler = provider;
+    }
+
+    return this.authHandler;
   }
 
   protected override async getConfirmationDetails(
@@ -128,113 +145,102 @@ export class RemoteAgentInvocation extends BaseToolInvocation<
     };
   }
 
-  async execute(_signal: AbortSignal): Promise<ToolResult> {
+  async execute(
+    _signal: AbortSignal,
+    updateOutput?: (output: string | AnsiOutput) => void,
+  ): Promise<ToolResult> {
     // 1. Ensure the agent is loaded (cached by manager)
     // We assume the user has provided an access token via some mechanism (TODO),
     // or we rely on ADC.
+    const reassembler = new A2AResultReassembler();
     try {
-      const isAsync = this.params.async === true;
-
-      // Only reuse session state for synchronous conversational turns.
-      // Async tasks (parallel workers) should get a fresh context to avoid blocking each other
-      // and to allow the proxy to track them as separate sub-agent instances.
-      if (!isAsync) {
-        const priorState = RemoteAgentInvocation.sessionState.get(
-          this.definition.name,
-        );
-        if (priorState) {
-          this.contextId = priorState.contextId;
-          this.taskId = priorState.taskId;
-        }
+      const priorState = RemoteAgentInvocation.sessionState.get(
+        this.definition.name,
+      );
+      if (priorState) {
+        this.contextId = priorState.contextId;
+        this.taskId = priorState.taskId;
       }
 
-      if (this.params.sessionId) {
-        this.contextId = this.params.sessionId;
-        this.taskId = undefined; // Force a new task in the requested session
-      }
+      const authHandler = await this.getAuthHandler();
 
-      const baseName = this.definition.name.replace(/_\d+$/, '');
-
-      if (!this.clientManager.getClient(baseName)) {
-        // Skip ADC authentication for localhost agents (team P2P mesh)
-        const agentUrl = this.definition.agentCardUrl ?? '';
-        const isLocalAgent = agentUrl.includes('localhost') || agentUrl.includes('127.0.0.1');
+      if (!this.clientManager.getClient(this.definition.name)) {
         await this.clientManager.loadAgent(
-          baseName,
+          this.definition.name,
           this.definition.agentCardUrl,
-          isLocalAgent ? undefined : this.authHandler,
+          authHandler,
         );
       }
 
       const message = this.params.query;
 
-      const isSubscribe = this.params.subscribe === true;
-      let pushNotificationUrl = process.env['A2A_WEBHOOK_URL'];
-
-      if (!this.contextId) {
-        this.contextId = uuidv4();
-      }
-
-      if (isAsync && isSubscribe && pushNotificationUrl) {
-        const callerName = process.env['CODER_AGENT_NAME'] || 'unknown';
-        const callerPort = process.env['CODER_AGENT_PORT'] || '4321';
-        const callerEndpoint = `http://127.0.0.1:${callerPort}`;
-        pushNotificationUrl = `${pushNotificationUrl}?caller=${encodeURIComponent(callerName)}&callee=${encodeURIComponent(baseName)}&caller_endpoint=${encodeURIComponent(callerEndpoint)}`;
-      }
-
-      console.log(`[RemoteAgentInvocation] Calling sendMessage to ${baseName} (as ${this.definition.name}), async: ${isAsync}, subscribe: ${isSubscribe}`);
-      const startMs = Date.now();
-      const response = await this.clientManager.sendMessage(
-        baseName,
+      const stream = this.clientManager.sendMessageStream(
+        this.definition.name,
         message,
         {
           contextId: this.contextId,
           taskId: this.taskId,
-          blocking: !isAsync,
-          pushNotificationUrl: isAsync ? pushNotificationUrl : undefined,
+          signal: _signal,
         },
       );
-      const elapsedMs = Date.now() - startMs;
-      console.log(`[RemoteAgentInvocation] sendMessage returned after ${elapsedMs}ms. Response kind: ${response.kind}`);
 
-      // Extracts IDs, taskID will be undefined if the task is completed/failed/canceled.
-      const { contextId, taskId } = extractIdsFromResponse(response);
+      let finalResponse: SendMessageResult | undefined;
 
-      this.contextId = contextId ?? this.contextId;
-      this.taskId = taskId;
+      for await (const chunk of stream) {
+        if (_signal.aborted) {
+          throw new Error('Operation aborted');
+        }
+        finalResponse = chunk;
+        reassembler.update(chunk);
 
+        if (updateOutput) {
+          updateOutput(reassembler.toString());
+        }
+
+        const {
+          contextId: newContextId,
+          taskId: newTaskId,
+          clearTaskId,
+        } = extractIdsFromResponse(chunk);
+
+        if (newContextId) {
+          this.contextId = newContextId;
+        }
+
+        this.taskId = clearTaskId ? undefined : (newTaskId ?? this.taskId);
+      }
+
+      if (!finalResponse) {
+        throw new Error('No response from remote agent.');
+      }
+
+      const finalOutput = reassembler.toString();
+
+      debugLogger.debug(
+        `[RemoteAgent] Final response from ${this.definition.name}:\n${JSON.stringify(finalResponse, null, 2)}`,
+      );
+
+      return {
+        llmContent: [{ text: finalOutput }],
+        returnDisplay: finalOutput,
+      };
+    } catch (error: unknown) {
+      const partialOutput = reassembler.toString();
+      const errorMessage = `Error calling remote agent: ${error instanceof Error ? error.message : String(error)}`;
+      const fullDisplay = partialOutput
+        ? `${partialOutput}\n\n${errorMessage}`
+        : errorMessage;
+      return {
+        llmContent: [{ text: fullDisplay }],
+        returnDisplay: fullDisplay,
+        error: { message: errorMessage },
+      };
+    } finally {
+      // Persist state even on partial failures or aborts to maintain conversational continuity.
       RemoteAgentInvocation.sessionState.set(this.definition.name, {
         contextId: this.contextId,
         taskId: this.taskId,
       });
-
-      // Extract the output text
-      let outputText: string;
-      if (isAsync) {
-        outputText = `작업이 백그라운드(비동기)로 제출되었습니다. (Task ID: ${taskId}, Session ID: ${this.contextId}).\n작업이 완료되면 시스템 알림(인터럽트)으로 결과를 받게 됩니다. 더 이상 결과를 기다리지 말고 즉시 다음 계획을 진행하세요.\n*참고: 이 백그라운드 워커와 같은 세션(Context)에서 추가 작업을 이어서 시키려면, 다음 호출 때 \`sessionId\` 파라미터로 "${this.contextId}"를 넘겨주세요.*`;
-      } else {
-        outputText = response.kind === 'task'
-          ? extractTaskText(response)
-          : response.kind === 'message'
-            ? extractMessageText(response)
-            : JSON.stringify(response);
-      }
-
-      debugLogger.debug(
-        `[RemoteAgent] Response from ${this.definition.name}:\n${JSON.stringify(response, null, 2)}`,
-      );
-
-      return {
-        llmContent: [{ text: outputText }],
-        returnDisplay: outputText,
-      };
-    } catch (error: unknown) {
-      const errorMessage = `Error calling remote agent: ${error instanceof Error ? error.message : String(error)}`;
-      return {
-        llmContent: [{ text: errorMessage }],
-        returnDisplay: errorMessage,
-        error: { message: errorMessage },
-      };
     }
   }
 }

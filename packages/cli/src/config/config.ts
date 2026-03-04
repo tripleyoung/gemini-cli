@@ -147,14 +147,6 @@ export async function parseArguments(
           type: 'boolean',
           description: 'Run in sandbox?',
         })
-        .option('config-dir', {
-          type: 'string',
-          description: 'Override the global GEMINI_CONFIG_DIR.',
-        })
-        .option('agents-dir', {
-          type: 'string',
-          description: 'Override the global GEMINI_AGENTS_DIR.',
-        })
 
         .option('yolo', {
           alias: 'y',
@@ -306,13 +298,6 @@ export async function parseArguments(
       throw new Error(msg);
     })
     .check((argv) => {
-      if (argv['configDir']) {
-        process.env['GEMINI_CONFIG_DIR'] = argv['configDir'] as string;
-      }
-      if (argv['agentsDir']) {
-        process.env['GEMINI_AGENTS_DIR'] = argv['agentsDir'] as string;
-      }
-
       // The 'query' positional can be a string (for one arg) or string[] (for multiple).
       // This guard safely checks if any positional argument was provided.
       // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
@@ -525,6 +510,10 @@ export async function loadCliConfig(
     clientVersion: await getVersion(),
   });
   await extensionManager.loadExtensions();
+
+  const extensionPlanSettings = extensionManager
+    .getExtensions()
+    .find((ext) => ext.isActive && ext.plan?.directory)?.plan;
 
   const experimentalJitContext = settings.experimental?.jitContext ?? false;
 
@@ -841,7 +830,11 @@ export async function loadCliConfig(
     enableExtensionReloading: settings.experimental?.extensionReloading,
     enableAgents: settings.experimental?.enableAgents,
     plan: settings.experimental?.plan,
-    planSettings: settings.general.plan,
+    tracker: settings.experimental?.taskTracker,
+    directWebFetch: settings.experimental?.directWebFetch,
+    planSettings: settings.general?.plan?.directory
+      ? settings.general.plan
+      : (extensionPlanSettings ?? settings.general?.plan),
     enableEventDrivenScheduler: true,
     skillsSupport: settings.skills?.enabled ?? true,
     disabledSkills: settings.skills?.disabled,
@@ -857,13 +850,13 @@ export async function loadCliConfig(
     interactive,
     trustedFolder,
     useBackgroundColor: settings.ui?.useBackgroundColor,
+    useAlternateBuffer: settings.ui?.useAlternateBuffer,
     useRipgrep: settings.tools?.useRipgrep,
     enableInteractiveShell: settings.tools?.shell?.enableInteractiveShell,
     shellToolInactivityTimeout: settings.tools?.shell?.inactivityTimeout,
     enableShellOutputEfficiency:
       settings.tools?.shell?.enableShellOutputEfficiency ?? true,
     skipNextSpeakerCheck: settings.model?.skipNextSpeakerCheck,
-    enablePromptCompletion: settings.general?.enablePromptCompletion,
     truncateToolOutputThreshold: settings.tools?.truncateToolOutputThreshold,
     eventEmitter: coreEvents,
     useWriteTodos: argv.useWriteTodos ?? settings.useWriteTodos,
@@ -871,9 +864,11 @@ export async function loadCliConfig(
       // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       format: (argv.outputFormat ?? settings.output?.format) as OutputFormat,
     },
+    gemmaModelRouter: settings.experimental?.gemmaModelRouter,
     fakeResponses: argv.fakeResponses,
     recordResponses: argv.recordResponses,
     retryFetchErrors: settings.general?.retryFetchErrors,
+    maxAttempts: settings.general?.maxAttempts,
     ptyInfo: ptyInfo?.name,
     disableLLMCorrection: settings.tools?.disableLLMCorrection,
     rawOutput: argv.rawOutput,
@@ -893,6 +888,7 @@ export async function loadCliConfig(
         agents: refreshedSettings.merged.agents,
       };
     },
+    enableConseca: settings.security?.enableConseca,
   });
 }
 

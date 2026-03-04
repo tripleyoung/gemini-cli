@@ -4,7 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { AgentCard, Message, MessageSendParams, Task } from '@a2a-js/sdk';
+import type {
+  AgentCard,
+  Message,
+  MessageSendParams,
+  Task,
+  TaskStatusUpdateEvent,
+  TaskArtifactUpdateEvent,
+} from '@a2a-js/sdk';
 import {
   type Client,
   ClientFactory,
@@ -16,9 +23,25 @@ import {
   createAuthenticatingFetchWithRetry,
 } from '@a2a-js/sdk/client';
 import { v4 as uuidv4 } from 'uuid';
+import { Agent as UndiciAgent } from 'undici';
 import { debugLogger } from '../utils/debugLogger.js';
 
-export type SendMessageResult = Message | Task;
+// Remote agents can take 10+ minutes (e.g. Deep Research).
+// Use a dedicated dispatcher so the global 5-min timeout isn't affected.
+const A2A_TIMEOUT = 1800000; // 30 minutes
+const a2aDispatcher = new UndiciAgent({
+  headersTimeout: A2A_TIMEOUT,
+  bodyTimeout: A2A_TIMEOUT,
+});
+const a2aFetch: typeof fetch = (input, init) =>
+  // @ts-expect-error The `dispatcher` property is a Node.js extension to fetch not present in standard types.
+  fetch(input, { ...init, dispatcher: a2aDispatcher });
+
+export type SendMessageResult =
+  | Message
+  | Task
+  | TaskStatusUpdateEvent
+  | TaskArtifactUpdateEvent;
 
 /**
  * Manages A2A clients and caches loaded agent information.
@@ -31,7 +54,7 @@ export class A2AClientManager {
   private clients = new Map<string, Client>();
   private agentCards = new Map<string, AgentCard>();
 
-  private constructor() { }
+  private constructor() {}
 
   /**
    * Gets the singleton instance of the A2AClientManager.
@@ -59,46 +82,21 @@ export class A2AClientManager {
    * @param authHandler Optional authentication handler to use for this agent.
    * @returns The loaded AgentCard.
    */
-
-
-  /**
-   * Loads an agent by fetching its AgentCard and caches the client.
-   * @param name The name to assign to the agent.
-   * @param agentCardUrl The full URL to the agent's card.
-   * @param authHandler Optional authentication handler to use for this agent.
-   * @param timeoutMs Optional timeout in milliseconds for the initial load.
-   * @returns The loaded AgentCard.
-   */
   async loadAgent(
     name: string,
     agentCardUrl: string,
     authHandler?: AuthenticationHandler,
-    timeoutMs?: number,
   ): Promise<AgentCard> {
     if (this.clients.has(name) && this.agentCards.has(name)) {
       throw new Error(`Agent with name '${name}' is already loaded.`);
     }
 
-    let fetchImpl: typeof fetch = fetch;
+    let fetchImpl: typeof fetch = a2aFetch;
     if (authHandler) {
-      fetchImpl = createAuthenticatingFetchWithRetry(fetch, authHandler);
+      fetchImpl = createAuthenticatingFetchWithRetry(a2aFetch, authHandler);
     }
 
-    // Apply a timeout specifically for the initial load if requested
-    let loadFetchImpl = fetchImpl;
-    if (timeoutMs) {
-      loadFetchImpl = async (input, init) => {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(new Error(`Fetch timed out after ${timeoutMs}ms`)), timeoutMs);
-        try {
-          return await fetchImpl(input, { ...init, signal: controller.signal });
-        } finally {
-          clearTimeout(timeoutId);
-        }
-      };
-    }
-
-    const resolver = new DefaultAgentCardResolver({ fetchImpl: loadFetchImpl });
+    const resolver = new DefaultAgentCardResolver({ fetchImpl });
 
     const options = ClientFactoryOptions.createFrom(
       ClientFactoryOptions.default,
@@ -111,27 +109,18 @@ export class A2AClientManager {
       },
     );
 
-    console.error(`[A2AClientManager] Attempting to load card for ${name} at ${agentCardUrl}`);
     const factory = new ClientFactory(options);
+    const client = await factory.createFromUrl(agentCardUrl, '');
+    const agentCard = await client.getAgentCard();
 
-    try {
-      const client = await factory.createFromUrl(agentCardUrl, '');
-      console.error(`[A2AClientManager] Created client for ${name}. Fetching card...`);
-      const agentCard = await client.getAgentCard();
-      console.error(`[A2AClientManager] Successfully fetched card for ${name}`);
+    this.clients.set(name, client);
+    this.agentCards.set(name, agentCard);
 
-      this.clients.set(name, client);
-      this.agentCards.set(name, agentCard);
+    debugLogger.debug(
+      `[A2AClientManager] Loaded agent '${name}' from ${agentCardUrl}`,
+    );
 
-      debugLogger.debug(
-        `[A2AClientManager] Loaded agent '${name}' from ${agentCardUrl}`,
-      );
-
-      return agentCard;
-    } catch (e) {
-      console.error(`[A2AClientManager] Fatal error fetching ${name}: ${e}`);
-      throw e;
-    }
+    return agentCard;
   }
 
   /**
@@ -144,18 +133,18 @@ export class A2AClientManager {
   }
 
   /**
-   * Sends a message to a loaded agent.
+   * Sends a message to a loaded agent and returns a stream of responses.
    * @param agentName The name of the agent to send the message to.
    * @param message The message content.
    * @param options Optional context and task IDs to maintain conversation state.
-   * @returns The response from the agent (Message or Task).
+   * @returns An async iterable of responses from the agent (Message or Task).
    * @throws Error if the agent returns an error response.
    */
-  async sendMessage(
+  async *sendMessageStream(
     agentName: string,
     message: string,
-    options?: { contextId?: string; taskId?: string; blocking?: boolean; pushNotificationUrl?: string },
-  ): Promise<SendMessageResult> {
+    options?: { contextId?: string; taskId?: string; signal?: AbortSignal },
+  ): AsyncIterable<SendMessageResult> {
     const client = this.clients.get(agentName);
     if (!client) {
       throw new Error(`Agent '${agentName}' not found.`);
@@ -170,21 +159,19 @@ export class A2AClientManager {
         contextId: options?.contextId,
         taskId: options?.taskId,
       },
-      configuration: {
-        blocking: options?.blocking ?? true,
-        pushNotificationConfig: options?.pushNotificationUrl ? { url: options.pushNotificationUrl } : undefined,
-      },
     };
 
     try {
-      return await client.sendMessage(messageParams);
+      yield* client.sendMessageStream(messageParams, {
+        signal: options?.signal,
+      });
     } catch (error: unknown) {
-      const prefix = `A2AClient SendMessage Error [${agentName}]`;
+      const prefix = `[A2AClientManager] sendMessageStream Error [${agentName}]`;
       if (error instanceof Error) {
         throw new Error(`${prefix}: ${error.message}`, { cause: error });
       }
       throw new Error(
-        `${prefix}: Unexpected error during sendMessage: ${String(error)}`,
+        `${prefix}: Unexpected error during sendMessageStream: ${String(error)}`,
       );
     }
   }

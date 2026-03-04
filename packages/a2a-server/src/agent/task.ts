@@ -13,6 +13,7 @@ import {
   getAllMCPServerStatuses,
   MCPServerStatus,
   isNodeError,
+  getErrorMessage,
   parseAndFormatApiError,
   safeLiteralReplace,
   DEFAULT_GUI_EDITOR,
@@ -26,11 +27,15 @@ import {
   type ToolCallConfirmationDetails,
   type Config,
   type UserTierId,
-  type AnsiOutput,
+  type ToolLiveOutput,
+  isSubagentProgress,
   EDIT_TOOL_NAMES,
   processRestorableToolCalls,
 } from '@google/gemini-cli-core';
-import type { RequestContext , ExecutionEventBus } from '@a2a-js/sdk/server';
+import {
+  type ExecutionEventBus,
+  type RequestContext,
+} from '@a2a-js/sdk/server';
 import type {
   TaskStatusUpdateEvent,
   TaskArtifactUpdateEvent,
@@ -43,20 +48,47 @@ import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../utils/logger.js';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { CoderAgentEvent, CODER_AGENT_METADATA_KEY } from '../types.js';
-import type {
-  CoderAgentMessage,
-  StateChange,
-  ToolCallUpdate,
-  TextContent,
-  TaskMetadata,
-  Thought,
-  ThoughtSummary,
-  Citation,
+import {
+  CoderAgentEvent,
+  type CoderAgentMessage,
+  type StateChange,
+  type ToolCallUpdate,
+  type TextContent,
+  type TaskMetadata,
+  type Thought,
+  type ThoughtSummary,
+  type Citation,
 } from '../types.js';
 import type { PartUnion, Part as genAiPart } from '@google/genai';
 
 type UnionKeys<T> = T extends T ? keyof T : never;
+
+type ConfirmationType = ToolCallConfirmationDetails['type'];
+
+const VALID_CONFIRMATION_TYPES: readonly ConfirmationType[] = [
+  'edit',
+  'exec',
+  'mcp',
+  'info',
+  'ask_user',
+  'exit_plan_mode',
+] as const;
+
+function isToolCallConfirmationDetails(
+  value: unknown,
+): value is ToolCallConfirmationDetails {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !('onConfirm' in value) ||
+    typeof value.onConfirm !== 'function' ||
+    !('type' in value) ||
+    typeof value.type !== 'string'
+  ) {
+    return false;
+  }
+  return (VALID_CONFIRMATION_TYPES as readonly string[]).includes(value.type);
+}
 
 export class Task {
   id: string;
@@ -73,8 +105,6 @@ export class Task {
   currentPromptId: string | undefined;
   promptCount = 0;
   autoExecute: boolean;
-  /** Accumulated text content sent during the task, included in the final status event. */
-  accumulatedText = '';
 
   // For tool waiting logic
   private pendingToolCalls: Map<string, string> = new Map(); //toolCallId --> status
@@ -235,19 +265,23 @@ export class Task {
     traceId?: string,
   ): TaskStatusUpdateEvent {
     const metadata: {
-      [key: string]: CoderAgentMessage | string | UserTierId | undefined;
+      coderAgent: CoderAgentMessage;
+      model: string;
+      userTier?: UserTierId;
+      error?: string;
+      traceId?: string;
     } = {
-      [CODER_AGENT_METADATA_KEY]: coderAgentMessage,
+      coderAgent: coderAgentMessage,
       model: this.modelInfo || this.config.getModel(),
       userTier: this.config.getUserTier(),
     };
 
     if (metadataError) {
-      metadata['error'] = metadataError;
+      metadata.error = metadataError;
     }
 
     if (traceId) {
-      metadata['traceId'] = traceId;
+      metadata.traceId = traceId;
     }
 
     return {
@@ -287,9 +321,6 @@ export class Task {
         taskId: this.id,
         contextId: this.contextId,
       };
-    } else if (final && this.accumulatedText) {
-      // Include accumulated text in the final event so clients can extract it
-      message = this._createTextMessage(this.accumulatedText);
     }
 
     const event = this._createStatusUpdateEvent(
@@ -306,11 +337,13 @@ export class Task {
 
   private _schedulerOutputUpdate(
     toolCallId: string,
-    outputChunk: string | AnsiOutput,
+    outputChunk: ToolLiveOutput,
   ): void {
     let outputAsText: string;
     if (typeof outputChunk === 'string') {
       outputAsText = outputChunk;
+    } else if (isSubagentProgress(outputChunk)) {
+      outputAsText = JSON.stringify(outputChunk);
     } else {
       outputAsText = outputChunk
         .map((line) => line.map((token) => token.text).join(''))
@@ -376,72 +409,18 @@ export class Task {
       }
 
       if (tc.status === 'awaiting_approval' && tc.confirmationDetails) {
-        this.pendingToolConfirmationDetails.set(
-          tc.request.callId,
-          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-          tc.confirmationDetails as ToolCallConfirmationDetails,
-        );
+        const details = tc.confirmationDetails;
+        if (isToolCallConfirmationDetails(details)) {
+          this.pendingToolConfirmationDetails.set(tc.request.callId, details);
+        }
       }
 
       // Only send an update if the status has actually changed.
       if (hasChanged) {
-        let coderAgentMessage: CoderAgentMessage;
-        if (tc.status === 'awaiting_approval') {
-          coderAgentMessage = { kind: CoderAgentEvent.ToolCallConfirmationEvent };
-        } else {
-          // Build ToolCallUpdate with toolName, status, rawInput, and responseText
-          const toolCallUpdate: ToolCallUpdate = {
-            kind: CoderAgentEvent.ToolCallUpdateEvent,
-            toolName: tc.request.name,
-            toolCallId: tc.request.callId,
-            status:
-              tc.status === 'success'
-                ? 'completed'
-                : tc.status === 'cancelled'
-                  ? 'failed'
-                  : tc.status === 'error'
-                    ? 'failed'
-                    : 'started',
-          };
-          // Always include rawInput (tool arguments) for display
-          toolCallUpdate.rawInput = tc.request.args ?? {};
-          // Extract responseText for completed tool calls
-          if (tc.status === 'success' && tc.response) {
-            let responseText = '';
-            // Try resultDisplay first
-            if (tc.response.resultDisplay) {
-              responseText = String(tc.response.resultDisplay);
-            }
-            // Fallback: extract from responseParts
-            if (!responseText && tc.response.responseParts) {
-              for (const p of tc.response.responseParts) {
-                if ('text' in p && typeof p.text === 'string') {
-                  responseText += p.text;
-                } else {
-                  const pAny = p as Record<string, unknown>;
-                  if (pAny['functionResponse']) {
-                    const fr = pAny['functionResponse'] as Record<string, unknown>;
-                    const frResp = fr['response'] as Record<string, unknown> | undefined;
-                    if (frResp && typeof frResp['output'] === 'string') {
-                      responseText += frResp['output'] as string;
-                    }
-                  }
-                }
-              }
-            }
-            // Fallback: data payload
-            if (!responseText && tc.response.data) {
-              const output = tc.response.data['output'];
-              if (typeof output === 'string') {
-                responseText = output;
-              }
-            }
-            if (responseText) {
-              toolCallUpdate.responseText = responseText;
-            }
-          }
-          coderAgentMessage = toolCallUpdate;
-        }
+        const coderAgentMessage: CoderAgentMessage =
+          tc.status === 'awaiting_approval'
+            ? { kind: CoderAgentEvent.ToolCallConfirmationEvent }
+            : { kind: CoderAgentEvent.ToolCallUpdateEvent };
         const message = this.toolStatusMessage(tc, this.id, this.contextId);
 
         const event = this._createStatusUpdateEvent(
@@ -465,11 +444,12 @@ export class Task {
       );
       toolCalls.forEach((tc: ToolCall) => {
         if (tc.status === 'awaiting_approval' && tc.confirmationDetails) {
-          // eslint-disable-next-line @typescript-eslint/no-floating-promises, @typescript-eslint/no-unsafe-type-assertion
-          (tc.confirmationDetails as ToolCallConfirmationDetails).onConfirm(
-            ToolConfirmationOutcome.ProceedOnce,
-          );
-          this.pendingToolConfirmationDetails.delete(tc.request.callId);
+          const details = tc.confirmationDetails;
+          if (isToolCallConfirmationDetails(details)) {
+            // eslint-disable-next-line @typescript-eslint/no-floating-promises
+            details.onConfirm(ToolConfirmationOutcome.ProceedOnce);
+            this.pendingToolConfirmationDetails.delete(tc.request.callId);
+          }
         }
       });
       return;
@@ -519,15 +499,13 @@ export class Task {
     T extends ToolCall | AnyDeclarativeTool,
     K extends UnionKeys<T>,
   >(from: T, ...fields: K[]): Partial<T> {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-    const ret = {} as Pick<T, K>;
+    const ret: Partial<T> = {};
     for (const field of fields) {
-      if (field in from) {
+      if (field in from && from[field] !== undefined) {
         ret[field] = from[field];
       }
     }
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-    return ret as Partial<T>;
+    return ret;
   }
 
   private toolStatusMessage(
@@ -538,8 +516,11 @@ export class Task {
     const messageParts: Part[] = [];
 
     // Create a serializable version of the ToolCall (pick necessary
-    // properties/avoid methods causing circular reference errors)
-    const serializableToolCall: Partial<ToolCall> = this._pickFields(
+    // properties/avoid methods causing circular reference errors).
+    // Type allows tool to be Partial<AnyDeclarativeTool> for serialization.
+    const serializableToolCall: Partial<Omit<ToolCall, 'tool'>> & {
+      tool?: Partial<AnyDeclarativeTool>;
+    } = this._pickFields(
       tc,
       'request',
       'status',
@@ -549,8 +530,7 @@ export class Task {
     );
 
     if (tc.tool) {
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-      serializableToolCall.tool = this._pickFields(
+      const toolFields = this._pickFields(
         tc.tool,
         'name',
         'displayName',
@@ -560,27 +540,13 @@ export class Task {
         'canUpdateOutput',
         'schema',
         'parameterSchema',
-      ) as AnyDeclarativeTool;
+      );
+      serializableToolCall.tool = toolFields;
     }
-
-    // ── ACP ToolCall spec compliance ──
-    // Map internal ToolCall fields to standard ACP ToolCall fields:
-    //   toolCallId = request.callId
-    //   title      = tool.displayName || tool.name || request.name
-    //   rawInput   = request.args
-    //   kind       = tool.kind || "execute"
-    const acpToolCall: Record<string, unknown> = {
-      ...(serializableToolCall as Record<string, unknown>),
-      toolCallId: tc.request.callId,
-      title:
-        tc.tool?.displayName || tc.tool?.name || tc.request.name || 'Tool Call',
-      rawInput: tc.request.args,
-      kind: tc.tool?.kind || 'execute',
-    };
 
     messageParts.push({
       kind: 'data',
-      data: acpToolCall,
+      data: serializableToolCall,
     } as Part);
 
     return {
@@ -598,8 +564,15 @@ export class Task {
     old_string: string,
     new_string: string,
   ): Promise<string> {
+    // Validate path to prevent path traversal vulnerabilities
+    const resolvedPath = path.resolve(this.config.getTargetDir(), file_path);
+    const pathError = this.config.validatePathAccess(resolvedPath, 'read');
+    if (pathError) {
+      throw new Error(`Path validation failed: ${pathError}`);
+    }
+
     try {
-      const currentContent = await fs.readFile(file_path, 'utf8');
+      const currentContent = await fs.readFile(resolvedPath, 'utf8');
       return this._applyReplacement(
         currentContent,
         old_string,
@@ -693,15 +666,32 @@ export class Task {
           request.args['old_string'] &&
           request.args['new_string']
         ) {
-          const newContent = await this.getProposedContent(
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-            request.args['file_path'] as string,
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-            request.args['old_string'] as string,
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-            request.args['new_string'] as string,
-          );
-          return { ...request, args: { ...request.args, newContent } };
+          const filePath = request.args['file_path'];
+          const oldString = request.args['old_string'];
+          const newString = request.args['new_string'];
+          if (
+            typeof filePath === 'string' &&
+            typeof oldString === 'string' &&
+            typeof newString === 'string'
+          ) {
+            // Resolve and validate path to prevent path traversal (user-controlled file_path).
+            const resolvedPath = path.resolve(
+              this.config.getTargetDir(),
+              filePath,
+            );
+            const pathError = this.config.validatePathAccess(
+              resolvedPath,
+              'read',
+            );
+            if (!pathError) {
+              const newContent = await this.getProposedContent(
+                resolvedPath,
+                oldString,
+                newString,
+              );
+              return { ...request, args: { ...request.args, newContent } };
+            }
+          }
         }
         return request;
       }),
@@ -793,19 +783,27 @@ export class Task {
         break;
       case GeminiEventType.Error:
       default: {
-        // Block scope for lexical declaration
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-        const errorEvent = event as ServerGeminiErrorEvent; // Type assertion
-        const errorMessage =
-          errorEvent.value?.error.message ?? 'Unknown error from LLM stream';
+        // Use type guard instead of unsafe type assertion
+        let errorEvent: ServerGeminiErrorEvent | undefined;
+        if (
+          event.type === GeminiEventType.Error &&
+          event.value &&
+          typeof event.value === 'object' &&
+          'error' in event.value
+        ) {
+          errorEvent = event;
+        }
+        const errorMessage = errorEvent?.value?.error
+          ? getErrorMessage(errorEvent.value.error)
+          : 'Unknown error from LLM stream';
         logger.error(
           '[Task] Received error event from LLM stream:',
           errorMessage,
         );
 
         let errMessage = `Unknown error from LLM stream: ${JSON.stringify(event)}`;
-        if (errorEvent.value) {
-          errMessage = parseAndFormatApiError(errorEvent.value);
+        if (errorEvent?.value?.error) {
+          errMessage = parseAndFormatApiError(errorEvent.value.error);
         }
         this.cancelPendingTools(`LLM stream error: ${errorMessage}`);
         this.setTaskStateAndPublishUpdate(
@@ -881,12 +879,11 @@ export class Task {
 
         // If `edit` tool call, pass updated payload if presesent
         if (confirmationDetails.type === 'edit') {
-          const payload = part.data['newContent']
-            ? ({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-                newContent: part.data['newContent'] as string,
-              } as ToolConfirmationPayload)
-            : undefined;
+          const newContent = part.data['newContent'];
+          const payload =
+            typeof newContent === 'string'
+              ? ({ newContent } as ToolConfirmationPayload)
+              : undefined;
           this.skipFinalTrueAfterInlineEdit = !!payload;
           try {
             await confirmationDetails.onConfirm(confirmationOutcome, payload);
@@ -1032,9 +1029,7 @@ export class Task {
         continue;
       }
 
-      // A2A v1: member-name discriminator (text property presence)
-      // Also supports v0.3 legacy: kind === 'text'
-      if (part.kind === 'text' || ('text' in part && part.text && !part.kind)) {
+      if (part.kind === 'text') {
         llmParts.push({ text: part.text });
         hasContentForLlm = true;
       }
@@ -1088,8 +1083,6 @@ export class Task {
     if (content === '') {
       return;
     }
-    // Accumulate text for inclusion in the final status event
-    this.accumulatedText += content;
     logger.info('[Task] Sending text content to event bus.');
     const message = this._createTextMessage(content);
     const textContent: TextContent = {

@@ -12,8 +12,10 @@ import { loadAgentsFromDirectory } from './agentLoader.js';
 import { CodebaseInvestigatorAgent } from './codebase-investigator.js';
 import { CliHelpAgent } from './cli-help-agent.js';
 import { GeneralistAgent } from './generalist-agent.js';
+import { BrowserAgentDefinition } from './browser/browserAgentDefinition.js';
 import { A2AClientManager } from './a2a-client-manager.js';
-import { ADCHandler } from './remote-invocation.js';
+import { A2AAuthProviderFactory } from './auth-provider/factory.js';
+import type { AuthenticationHandler } from '@a2a-js/sdk/client';
 import { type z } from 'zod';
 import { debugLogger } from '../utils/debugLogger.js';
 import { isAutoModel } from '../config/models.js';
@@ -21,7 +23,7 @@ import {
   type ModelConfig,
   ModelConfigService,
 } from '../services/modelConfigService.js';
-import { ApprovalMode, PolicyDecision, PRIORITY_SUBAGENT_TOOL } from '../policy/types.js';
+import { PolicyDecision, PRIORITY_SUBAGENT_TOOL } from '../policy/types.js';
 
 /**
  * Returns the model config alias for a given agent definition.
@@ -42,7 +44,7 @@ export class AgentRegistry {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly allDefinitions = new Map<string, AgentDefinition<any>>();
 
-  constructor(private readonly config: Config) { }
+  constructor(private readonly config: Config) {}
 
   /**
    * Discovers and loads agents.
@@ -117,7 +119,20 @@ export class AgentRegistry {
       coreEvents.emitFeedback('error', `Agent loading error: ${error.message}`);
     }
     await Promise.allSettled(
-      userAgents.agents.map((agent) => this.registerAgent(agent)),
+      userAgents.agents.map(async (agent) => {
+        try {
+          await this.registerAgent(agent);
+        } catch (e) {
+          debugLogger.warn(
+            `[AgentRegistry] Error registering user agent "${agent.name}":`,
+            e,
+          );
+          coreEvents.emitFeedback(
+            'error',
+            `Error registering user agent "${agent.name}": ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }),
     );
 
     // Load project-level agents: .gemini/agents/ (relative to Project Root)
@@ -172,7 +187,20 @@ export class AgentRegistry {
       }
 
       await Promise.allSettled(
-        agentsToRegister.map((agent) => this.registerAgent(agent)),
+        agentsToRegister.map(async (agent) => {
+          try {
+            await this.registerAgent(agent);
+          } catch (e) {
+            debugLogger.warn(
+              `[AgentRegistry] Error registering project agent "${agent.name}":`,
+              e,
+            );
+            coreEvents.emitFeedback(
+              'error',
+              `Error registering project agent "${agent.name}": ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+        }),
       );
     } else {
       coreEvents.emitFeedback(
@@ -185,7 +213,20 @@ export class AgentRegistry {
     for (const extension of this.config.getExtensions()) {
       if (extension.isActive && extension.agents) {
         await Promise.allSettled(
-          extension.agents.map((agent) => this.registerAgent(agent)),
+          extension.agents.map(async (agent) => {
+            try {
+              await this.registerAgent(agent);
+            } catch (e) {
+              debugLogger.warn(
+                `[AgentRegistry] Error registering extension agent "${agent.name}":`,
+                e,
+              );
+              coreEvents.emitFeedback(
+                'error',
+                `Error registering extension agent "${agent.name}": ${e instanceof Error ? e.message : String(e)}`,
+              );
+            }
+          }),
         );
       }
     }
@@ -201,6 +242,13 @@ export class AgentRegistry {
     this.registerLocalAgent(CodebaseInvestigatorAgent(this.config));
     this.registerLocalAgent(CliHelpAgent(this.config));
     this.registerLocalAgent(GeneralistAgent(this.config));
+
+    // Register the browser agent if enabled in settings.
+    // Tools are configured dynamically at invocation time via browserAgentFactory.
+    const browserConfig = this.config.getBrowserAgentConfig();
+    if (browserConfig.enabled) {
+      this.registerLocalAgent(BrowserAgentDefinition(this.config));
+    }
   }
 
   private async refreshAgents(): Promise<void> {
@@ -290,16 +338,11 @@ export class AgentRegistry {
     // Clean up any old dynamic policy for this tool (e.g. if we are overwriting an agent)
     policyEngine.removeRulesForTool(definition.name, 'AgentRegistry (Dynamic)');
 
-    // In YOLO mode, auto-approve remote agents to avoid blocking in headless
-    // environments (e.g. A2A servers) where no user is available to confirm.
-    const isYolo =
-      this.config.getApprovalMode() === ApprovalMode.YOLO;
-
     // Add the new dynamic policy
     policyEngine.addRule({
       toolName: definition.name,
       decision:
-        definition.kind === 'local' || isYolo
+        definition.kind === 'local'
           ? PolicyDecision.ALLOW
           : PolicyDecision.ASK_USER,
       priority: PRIORITY_SUBAGENT_TOOL,
@@ -332,9 +375,10 @@ export class AgentRegistry {
     }
 
     // Basic validation
-    if (!definition.name || !definition.description) {
+    // Remote agents can have an empty description initially as it will be populated from the AgentCard
+    if (!definition.name) {
       debugLogger.warn(
-        `[AgentRegistry] Skipping invalid agent definition. Missing name or description.`,
+        `[AgentRegistry] Skipping invalid agent definition. Missing name.`,
       );
       return;
     }
@@ -357,54 +401,60 @@ export class AgentRegistry {
       debugLogger.log(`[AgentRegistry] Overriding agent '${definition.name}'`);
     }
 
+    const remoteDef = definition;
+
+    // Capture the original description from the first registration
+    if (remoteDef.originalDescription === undefined) {
+      remoteDef.originalDescription = remoteDef.description;
+    }
+
     // Log remote A2A agent registration for visibility.
     try {
-      // If we are currently running an A2A Server, skip fetching remote peers' agent cards.
-      // This prevents a mutual deadlock ring where 4 starting A2A servers all try to fetch
-      // each other's (not yet started) HTTP servers during Config.initialize().
-      if (this.config.isA2aServer()) {
-        if (this.config.getDebugMode()) {
-          debugLogger.log(
-            `[AgentRegistry] Registered remote agent '${definition.name}' (Card fetch deferred for A2A server mesh)`,
+      const clientManager = A2AClientManager.getInstance();
+      let authHandler: AuthenticationHandler | undefined;
+      if (definition.auth) {
+        const provider = await A2AAuthProviderFactory.create({
+          authConfig: definition.auth,
+          agentName: definition.name,
+        });
+        if (!provider) {
+          throw new Error(
+            `Failed to create auth provider for agent '${definition.name}'`,
           );
         }
-        this.agents.set(definition.name, definition);
-        this.addAgentPolicy(definition);
-        return;
+        authHandler = provider;
       }
 
-      const clientManager = A2AClientManager.getInstance();
-      // Try ADC first for secure platforms (e.g. Vertex AI), then fall back to
-      // unauthenticated fetch for local/private-network A2A servers.
-      let agentCard;
-      try {
-        const authHandler = new ADCHandler();
-        agentCard = await clientManager.loadAgent(
-          definition.name,
-          definition.agentCardUrl,
-          authHandler,
-          1000 // 1s timeout to prevent deadlocks during concurrent startup
-        );
-      } catch (adcError) {
-        debugLogger.warn(
-          `[AgentRegistry] ADC auth failed for "${definition.name}" (${definition.agentCardUrl}); retrying without auth`,
-          adcError,
-        );
-        agentCard = await clientManager.loadAgent(
-          definition.name,
-          definition.agentCardUrl,
-          undefined,
-          1000 // 1s timeout
-        );
+      const agentCard = await clientManager.loadAgent(
+        remoteDef.name,
+        remoteDef.agentCardUrl,
+        authHandler,
+      );
+
+      const userDescription = remoteDef.originalDescription;
+      const agentDescription = agentCard.description;
+      const descriptions: string[] = [];
+
+      if (userDescription?.trim()) {
+        descriptions.push(`User Description: ${userDescription.trim()}`);
+      }
+      if (agentDescription?.trim()) {
+        descriptions.push(`Agent Description: ${agentDescription.trim()}`);
       }
       if (agentCard.skills && agentCard.skills.length > 0) {
-        definition.description = agentCard.skills
+        const skillsList = agentCard.skills
           .map(
             (skill: { name: string; description: string }) =>
-              `${skill.name}: ${skill.description}`,
+              `${skill.name}: ${skill.description || 'No description provided'}`,
           )
           .join('\n');
+        descriptions.push(`Skills:\n${skillsList}`);
       }
+
+      if (descriptions.length > 0) {
+        definition.description = descriptions.join('\n');
+      }
+
       if (this.config.getDebugMode()) {
         debugLogger.log(
           `[AgentRegistry] Registered remote agent '${definition.name}' with card: ${definition.agentCardUrl}`,
@@ -413,10 +463,9 @@ export class AgentRegistry {
       this.agents.set(definition.name, definition);
       this.addAgentPolicy(definition);
     } catch (e) {
-      debugLogger.warn(
-        `[AgentRegistry] Error loading A2A agent "${definition.name}":`,
-        e,
-      );
+      const errorMessage = `Error loading A2A agent "${definition.name}": ${e instanceof Error ? e.message : String(e)}`;
+      debugLogger.warn(`[AgentRegistry] ${errorMessage}`, e);
+      coreEvents.emitFeedback('error', errorMessage);
     }
   }
 

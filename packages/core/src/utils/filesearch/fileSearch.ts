@@ -6,12 +6,10 @@
 
 import path from 'node:path';
 import picomatch from 'picomatch';
-import type { Ignore } from './ignore.js';
-import { loadIgnoreRules } from './ignore.js';
+import { loadIgnoreRules, type Ignore } from './ignore.js';
 import { ResultCache } from './result-cache.js';
 import { crawl } from './crawler.js';
-import type { FzfResultItem } from 'fzf';
-import { AsyncFzf } from 'fzf';
+import { AsyncFzf, type FzfResultItem } from 'fzf';
 import { unescapePath } from '../paths.js';
 import type { FileDiscoveryService } from '../../services/fileDiscoveryService.js';
 
@@ -149,6 +147,7 @@ class RecursiveFileSearch implements FileSearch {
         filteredCandidates = await this.fzf
           .find(pattern)
           .then((results: Array<FzfResultItem<string>>) =>
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-return
             results.map((entry: FzfResultItem<string>) => entry.item),
           )
           .catch(() => {

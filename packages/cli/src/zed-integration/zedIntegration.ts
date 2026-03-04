@@ -4,22 +4,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type {
-  Config,
-  GeminiChat,
-  ToolResult,
-  ToolCallConfirmationDetails,
-  FilterFilesOptions,
-  ConversationRecord,
-} from '@google/gemini-cli-core';
 import {
+  type Config,
+  type GeminiChat,
+  type ToolResult,
+  type ToolCallConfirmationDetails,
+  type FilterFilesOptions,
+  type ConversationRecord,
   CoreToolCallStatus,
   AuthType,
   logToolCall,
   convertToFunctionResponse,
   ToolConfirmationOutcome,
   clearCachedCredentialFile,
-  clearOauthClientCache,
   isNodeError,
   getErrorMessage,
   isWithinRoot,
@@ -32,19 +29,33 @@ import {
   ReadManyFilesTool,
   REFERENCE_CONTENT_START,
   resolveModel,
-  DEFAULT_MODEL_CONFIGS,
-  VALID_GEMINI_MODELS,
   createWorkingStdio,
   startupProfiler,
   Kind,
   partListUnionToString,
   LlmRole,
   ApprovalMode,
+  getVersion,
+  convertSessionToClientHistory,
+  DEFAULT_GEMINI_MODEL,
+  DEFAULT_GEMINI_FLASH_MODEL,
+  DEFAULT_GEMINI_FLASH_LITE_MODEL,
+  PREVIEW_GEMINI_MODEL,
+  PREVIEW_GEMINI_3_1_MODEL,
+  PREVIEW_GEMINI_3_1_CUSTOM_TOOLS_MODEL,
+  PREVIEW_GEMINI_FLASH_MODEL,
+  DEFAULT_GEMINI_MODEL_AUTO,
+  PREVIEW_GEMINI_MODEL_AUTO,
+  getDisplayString,
 } from '@google/gemini-cli-core';
 import * as acp from '@agentclientprotocol/sdk';
 import { AcpFileSystemService } from './fileSystemService.js';
 import { getAcpErrorMessage } from './acpErrors.js';
 import { Readable, Writable } from 'node:stream';
+
+function hasMeta(obj: unknown): obj is { _meta?: Record<string, unknown> } {
+  return typeof obj === 'object' && obj !== null && '_meta' in obj;
+}
 import type { Content, Part, FunctionCall } from '@google/genai';
 import type { LoadedSettings } from '../config/settings.js';
 import { SettingScope, loadSettings } from '../config/settings.js';
@@ -56,16 +67,16 @@ import { randomUUID } from 'node:crypto';
 import type { CliArgs } from '../config/config.js';
 import { loadCliConfig } from '../config/config.js';
 import { runExitCleanup } from '../utils/cleanup.js';
-import {
-  SessionSelector,
-  convertSessionToHistoryFormats,
-} from '../utils/sessionUtils.js';
+import { SessionSelector } from '../utils/sessionUtils.js';
 
+import { CommandHandler } from './commandHandler.js';
 export async function runZedIntegration(
   config: Config,
   settings: LoadedSettings,
   argv: CliArgs,
 ) {
+  // ... (skip unchanged lines) ...
+
   const { stdout: workingStdout } = createWorkingStdio();
   const stdout = Writable.toWeb(workingStdout) as WritableStream;
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
@@ -86,13 +97,14 @@ export async function runZedIntegration(
 export class GeminiAgent {
   private sessions: Map<string, Session> = new Map();
   private clientCapabilities: acp.ClientCapabilities | undefined;
+  private apiKey: string | undefined;
 
   constructor(
     private config: Config,
     private settings: LoadedSettings,
     private argv: CliArgs,
     private connection: acp.AgentSideConnection,
-  ) { }
+  ) {}
 
   async initialize(
     args: acp.InitializeRequest,
@@ -102,25 +114,35 @@ export class GeminiAgent {
       {
         id: AuthType.LOGIN_WITH_GOOGLE,
         name: 'Log in with Google',
-        description: null,
+        description: 'Log in with your Google account',
       },
       {
         id: AuthType.USE_GEMINI,
-        name: 'Use Gemini API key',
-        description:
-          'Requires setting the `GEMINI_API_KEY` environment variable',
+        name: 'Gemini API key',
+        description: 'Use an API key with Gemini Developer API',
+        _meta: {
+          'api-key': {
+            provider: 'google',
+          },
+        },
       },
       {
         id: AuthType.USE_VERTEX_AI,
         name: 'Vertex AI',
-        description: null,
+        description: 'Use an API key with Vertex AI GenAI API',
       },
     ];
 
     await this.config.initialize();
+    const version = await getVersion();
     return {
       protocolVersion: acp.PROTOCOL_VERSION,
       authMethods,
+      agentInfo: {
+        name: 'gemini-cli',
+        title: 'Gemini CLI',
+        version,
+      },
       agentCapabilities: {
         loadSession: true,
         promptCapabilities: {
@@ -132,18 +154,12 @@ export class GeminiAgent {
           http: true,
           sse: true,
         },
-        _meta: {
-          'ilhae.dev': {
-            skills: true,
-            mcpManagement: true,
-            modelSelection: true,
-          },
-        },
       },
     };
   }
 
-  async authenticate({ methodId }: acp.AuthenticateRequest): Promise<void> {
+  async authenticate(req: acp.AuthenticateRequest): Promise<void> {
+    const { methodId } = req;
     const method = z.nativeEnum(AuthType).parse(methodId);
     const selectedAuthType = this.settings.merged.security.auth.selectedType;
 
@@ -151,17 +167,21 @@ export class GeminiAgent {
     if (selectedAuthType && selectedAuthType !== method) {
       await clearCachedCredentialFile();
     }
+    // Check for api-key in _meta
+    const meta = hasMeta(req) ? req._meta : undefined;
+    const apiKey =
+      typeof meta?.['api-key'] === 'string' ? meta['api-key'] : undefined;
 
     // Refresh auth with the requested method
     // This will reuse existing credentials if they're valid,
     // or perform new authentication if needed
     try {
-      await this.config.refreshAuth(method);
+      if (apiKey) {
+        this.apiKey = apiKey;
+      }
+      await this.config.refreshAuth(method, apiKey ?? this.apiKey);
     } catch (e) {
-      throw new acp.RequestError(
-        getErrorStatus(e) || 401,
-        getAcpErrorMessage(e),
-      );
+      throw new acp.RequestError(-32000, getAcpErrorMessage(e));
     }
     this.settings.setValue(
       SettingScope.User,
@@ -174,25 +194,14 @@ export class GeminiAgent {
     cwd,
     mcpServers,
   }: acp.NewSessionRequest): Promise<acp.NewSessionResponse> {
-    const t0 = performance.now();
     const sessionId = randomUUID();
     const loadedSettings = loadSettings(cwd);
-
-    let config: Config;
-    let reusedConfig = false;
-    if (mcpServers.length === 0 && (!cwd || cwd === this.config.getProjectRoot())) {
-      config = this.config;
-      config.setSessionId(sessionId);
-      reusedConfig = true;
-    } else {
-      config = await this.newSessionConfig(
-        sessionId,
-        cwd,
-        mcpServers,
-        loadedSettings,
-      );
-    }
-    const t1 = performance.now();
+    const config = await this.newSessionConfig(
+      sessionId,
+      cwd,
+      mcpServers,
+      loadedSettings,
+    );
 
     const authType =
       loadedSettings.merged.security.auth.selectedType || AuthType.USE_GEMINI;
@@ -200,7 +209,7 @@ export class GeminiAgent {
     let isAuthenticated = false;
     let authErrorMessage = '';
     try {
-      await config.refreshAuth(authType);
+      await config.refreshAuth(authType, this.apiKey);
       isAuthenticated = true;
 
       // Extra validation for Gemini API key
@@ -219,11 +228,10 @@ export class GeminiAgent {
         `Authentication failed: ${e instanceof Error ? e.stack : e}`,
       );
     }
-    const t2 = performance.now();
 
     if (!isAuthenticated) {
       throw new acp.RequestError(
-        401,
+        -32000,
         authErrorMessage || 'Authentication required.',
       );
     }
@@ -238,35 +246,42 @@ export class GeminiAgent {
       config.setFileSystemService(acpFileSystemService);
     }
 
-    if (!reusedConfig) {
-      await config.initialize();
-      startupProfiler.flush(config);
-    }
-    const t3 = performance.now();
+    await config.initialize();
+    startupProfiler.flush(config);
 
     const geminiClient = config.getGeminiClient();
     const chat = await geminiClient.startChat();
-    const session = new Session(sessionId, chat, config, this.connection);
+    const session = new Session(
+      sessionId,
+      chat,
+      config,
+      this.connection,
+      this.settings,
+    );
     this.sessions.set(sessionId, session);
-    // Fire-and-forget: send available slash commands after session is ready (ACP spec)
-    // eslint-disable-next-line @typescript-eslint/no-floating-promises
-    session.sendAvailableCommands(config);
-    const t4 = performance.now();
 
-    console.log(`[Profile] newSession total: ${(t4 - t0).toFixed(2)}ms (newConfig: ${(t1 - t0).toFixed(2)}ms, auth: ${(t2 - t1).toFixed(2)}ms, initConfig(MCP): ${(t3 - t2).toFixed(2)}ms, startChat: ${(t4 - t3).toFixed(2)}ms, reused: ${reusedConfig})`);
+    setTimeout(() => {
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      session.sendAvailableCommands();
+    }, 0);
 
-    return {
+    const { availableModels, currentModelId } = buildAvailableModels(
+      config,
+      loadedSettings,
+    );
+
+    const response = {
       sessionId,
       modes: {
         availableModes: buildAvailableModes(config.isPlanEnabled()),
         currentModeId: config.getApprovalMode(),
       },
       models: {
-        availableModels: buildAvailableModels(),
-        currentModelId: config.getModel(),
+        availableModels,
+        currentModelId,
       },
-      configOptions: buildAvailableConfigOptions(config.getModel())
     };
+    return response;
   }
 
   async loadSession({
@@ -274,25 +289,15 @@ export class GeminiAgent {
     cwd,
     mcpServers,
   }: acp.LoadSessionRequest): Promise<acp.LoadSessionResponse> {
-    const t0 = performance.now();
     const config = await this.initializeSessionConfig(
       sessionId,
       cwd,
       mcpServers,
     );
-    const t1 = performance.now();
 
     const sessionSelector = new SessionSelector(config);
-    let sessionData: any;
-    let sessionPath: string | undefined;
-    try {
-      const result = await sessionSelector.resolveSession(sessionId);
-      sessionData = result.sessionData;
-      sessionPath = result.sessionPath;
-    } catch (e) {
-      debugLogger.warn(`Session not found on disk, creating empty session for: ${sessionId}`);
-    }
-    const t2 = performance.now();
+    const { sessionData, sessionPath } =
+      await sessionSelector.resolveSession(sessionId);
 
     if (this.clientCapabilities?.fs) {
       const acpFileSystemService = new AcpFileSystemService(
@@ -304,51 +309,49 @@ export class GeminiAgent {
       config.setFileSystemService(acpFileSystemService);
     }
 
+    const clientHistory = convertSessionToClientHistory(sessionData.messages);
+
     const geminiClient = config.getGeminiClient();
     await geminiClient.initialize();
-    const t3 = performance.now();
-
-    if (sessionData && sessionPath) {
-      const { clientHistory } = convertSessionToHistoryFormats(
-        sessionData.messages,
-      );
-      await geminiClient.resumeChat(clientHistory, {
-        conversation: sessionData,
-        filePath: sessionPath,
-      });
-    } else {
-      await geminiClient.startChat();
-    }
-    const t4 = performance.now();
+    await geminiClient.resumeChat(clientHistory, {
+      conversation: sessionData,
+      filePath: sessionPath,
+    });
 
     const session = new Session(
       sessionId,
       geminiClient.getChat(),
       config,
       this.connection,
+      this.settings,
     );
     this.sessions.set(sessionId, session);
 
-    if (sessionData) {
-      // Stream history back to client
+    // Stream history back to client
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    session.streamHistory(sessionData.messages);
+
+    setTimeout(() => {
       // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      session.streamHistory(sessionData.messages);
-    }
-    const t5 = performance.now();
+      session.sendAvailableCommands();
+    }, 0);
 
-    console.log(`[Profile] loadSession total: ${(t5 - t0).toFixed(2)}ms (initConfig: ${(t1 - t0).toFixed(2)}ms, resolve: ${(t2 - t1).toFixed(2)}ms, geminiInit: ${(t3 - t2).toFixed(2)}ms, resumeChat: ${(t4 - t3).toFixed(2)}ms, sessionWrap: ${(t5 - t4).toFixed(2)}ms)`);
+    const { availableModels, currentModelId } = buildAvailableModels(
+      config,
+      this.settings,
+    );
 
-    return {
+    const response = {
       modes: {
         availableModes: buildAvailableModes(config.isPlanEnabled()),
         currentModeId: config.getApprovalMode(),
       },
       models: {
-        availableModels: buildAvailableModels(),
-        currentModelId: config.getModel(),
+        availableModels,
+        currentModelId,
       },
-      configOptions: buildAvailableConfigOptions(config.getModel())
     };
+    return response;
   }
 
   private async initializeSessionConfig(
@@ -356,40 +359,28 @@ export class GeminiAgent {
     cwd: string,
     mcpServers: acp.McpServer[],
   ): Promise<Config> {
-    const t0 = performance.now();
     const selectedAuthType = this.settings.merged.security.auth.selectedType;
     if (!selectedAuthType) {
       throw acp.RequestError.authRequired();
     }
 
-    // Try to reuse the global pre-warmed config if there are no session-specific MCP servers
-    // and the CWD is the same (or we don't strictly care about strictly bounding the CWD for MCPs)
-    let config: Config;
-    let reusedConfig = false;
-    if (mcpServers.length === 0 && (!cwd || cwd === this.config.getProjectRoot())) {
-      config = this.config;
-      config.setSessionId(sessionId);
-      reusedConfig = true;
-    } else {
-      config = await this.newSessionConfig(sessionId, cwd, mcpServers);
-    }
-    const t1 = performance.now();
+    // 1. Create config WITHOUT initializing it (no MCP servers started yet)
+    const config = await this.newSessionConfig(sessionId, cwd, mcpServers);
 
+    // 2. Authenticate BEFORE initializing configuration or starting MCP servers.
+    // This satisfies the security requirement to verify the user before executing
+    // potentially unsafe server definitions.
     try {
-      await config.refreshAuth(selectedAuthType);
+      await config.refreshAuth(selectedAuthType, this.apiKey);
     } catch (e) {
       debugLogger.error(`Authentication failed: ${e}`);
       throw acp.RequestError.authRequired();
     }
-    const t2 = performance.now();
 
-    if (!reusedConfig) {
-      await config.initialize();
-      startupProfiler.flush(config);
-    }
-    const t3 = performance.now();
-
-    console.log(`[Profile] initializeSessionConfig total: ${(t3 - t0).toFixed(2)}ms (newConfig: ${(t1 - t0).toFixed(2)}ms, auth: ${(t2 - t1).toFixed(2)}ms, initConfig(MCP): ${(t3 - t2).toFixed(2)}ms, reused: ${reusedConfig})`);
+    // 3. Now that we are authenticated, it is safe to initialize the config
+    // which starts the MCP servers and other heavy resources.
+    await config.initialize();
+    startupProfiler.flush(config);
 
     return config;
   }
@@ -454,17 +445,6 @@ export class GeminiAgent {
     await session.cancelPendingPrompt();
   }
 
-  async clearSession(
-    params: acp.ClearSessionRequest,
-  ): Promise<acp.ClearSessionResponse> {
-    const session = this.sessions.get(params.sessionId);
-    if (!session) {
-      throw new Error(`Session not found: ${params.sessionId}`);
-    }
-    await session.clear(params.preserveSummary);
-    return {};
-  }
-
   async prompt(params: acp.PromptRequest): Promise<acp.PromptResponse> {
     const session = this.sessions.get(params.sessionId);
     if (!session) {
@@ -483,344 +463,29 @@ export class GeminiAgent {
     return session.setMode(params.modeId);
   }
 
-  async unstable_forkSession(params: acp.ForkSessionRequest): Promise<acp.ForkSessionResponse> {
-    throw new acp.RequestError(404, 'Not Implemented: session/fork is not yet supported');
-  }
-
-  async unstable_resumeSession(params: acp.ResumeSessionRequest): Promise<acp.ResumeSessionResponse> {
-    throw new acp.RequestError(404, 'Not Implemented: session/resume is not yet supported');
-  }
-
-  async unstable_listSessions(params: acp.ListSessionsRequest): Promise<acp.ListSessionsResponse> {
-    const sessionSelector = new SessionSelector(this.config);
-    const sessions = await sessionSelector.listSessions();
-
-    const mappedSessions = sessions.map((s) => {
-      // Create a clean display string without the markdown block and extra spacing
-      const cleanedMessage = s.firstUserMessage
-        ? s.firstUserMessage.replace(/```[\s\S]*?```/g, '[Code Block]').replace(/\s+/g, ' ').trim()
-        : 'Empty session';
-
-      const title = cleanedMessage.length > 120
-        ? cleanedMessage.substring(0, 117) + '...'
-        : cleanedMessage;
-
-      return {
-        sessionId: s.id,
-        title,
-        updatedAt: s.lastUpdated,
-        cwd: this.config.getTargetDir()
-      };
-    });
-
-    return {
-      sessions: mappedSessions
-    };
-  }
-
-  async unstable_setSessionModel(params: acp.SetSessionModelRequest): Promise<acp.SetSessionModelResponse | void> {
+  async unstable_setSessionModel(
+    params: acp.SetSessionModelRequest,
+  ): Promise<acp.SetSessionModelResponse> {
     const session = this.sessions.get(params.sessionId);
     if (!session) {
-      throw new acp.RequestError(404, `Session not found: ${params.sessionId}`);
+      throw new Error(`Session not found: ${params.sessionId}`);
     }
-    session.setModel(params.modelId);
-  }
-
-  async setSessionConfigOption(params: acp.SetSessionConfigOptionRequest): Promise<acp.SetSessionConfigOptionResponse> {
-    const session = this.sessions.get(params.sessionId);
-    if (!session) {
-      throw new acp.RequestError(404, `Session not found: ${params.sessionId}`);
-    }
-    return session.setConfigOption(params.configId, params.value);
-  }
-
-  async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    switch (method) {
-      case '_agent/set_credentials': {
-        const apiKey = params['apiKey'] as string | undefined;
-        const useCcpa = params['useCcpa'] as boolean | undefined;
-
-        try {
-          if (apiKey) {
-            process.env['GEMINI_API_KEY'] = apiKey;
-            await this.config.refreshAuth(AuthType.USE_GEMINI);
-          } else if (useCcpa) {
-            process.env['USE_CCPA'] = 'true';
-            await clearCachedCredentialFile();
-            clearOauthClientCache();
-            await this.config.refreshAuth(AuthType.LOGIN_WITH_GOOGLE);
-          }
-          return { success: true };
-        } catch (e) {
-          debugLogger.error('[ACP/HTTP] set_credentials failed:', e);
-          return { success: false, error: String(e) };
-        }
-      }
-      case '_agent/capabilities': {
-        const allSkills = this.config.getSkillManager()?.getAllSkills() || [];
-        const skills = allSkills.map(s => ({
-          id: s.name,
-          name: s.name,
-          description: s.description,
-          location: s.location,
-          disabled: !!s.disabled,
-          isBuiltin: !!s.isBuiltin
-        }));
-
-        const mcpConfigs = this.config.getMcpClientManager()?.getMcpServers() || {};
-        const callbacks = this.config.getMcpEnablementCallbacks();
-        const mcps = await Promise.all(Object.entries(mcpConfigs).map(async ([name, mcpConfig]) => {
-          let disabled = false;
-          if (callbacks) {
-            const sessionDisabled = callbacks.isSessionDisabled(name);
-            const fileEnabled = await callbacks.isFileEnabled(name);
-            disabled = sessionDisabled || !fileEnabled;
-          }
-          return {
-            id: name,
-            name: name,
-            description: mcpConfig.description || `MCP Server: ${name}`,
-            disabled
-          };
-        }));
-
-        return { skills, mcps };
-      }
-      case '_agent/open_file': {
-        const targetPath = params['path'] as string | undefined;
-        if (targetPath) {
-          try {
-            const { exec } = await import('child_process');
-            const editor = process.env['EDITOR'] || 'code';
-            exec(`${editor} "${targetPath}"`, (err) => {
-              if (err) debugLogger.error(`[ACP] Failed to open file: ${err}`);
-            });
-          } catch (e) {
-            debugLogger.error(`[ACP] Failed to open file: ${e}`);
-          }
-        }
-        return { success: true };
-      }
-      case '_agent/skill/toggle': {
-        const skillName = params['name'] as string | undefined;
-        const enable = params['enable'] as boolean | undefined;
-        if (!skillName || enable === undefined) {
-          return { success: false, error: 'Missing name or enable param' };
-        }
-
-        try {
-          const { enableSkill, disableSkill } = await import('../utils/skillSettings.js');
-          const { loadSettings, SettingScope } = await import('../config/settings.js');
-          const workspaceDir = process.cwd();
-          const settings = loadSettings(workspaceDir);
-
-          if (enable) {
-            enableSkill(settings, skillName);
-          } else {
-            disableSkill(settings, skillName, SettingScope.User);
-          }
-
-          await this.config.reloadSkills();
-          return { success: true };
-        } catch (e) {
-          debugLogger.error(`[ACP] Failed to toggle skill ${skillName}: ${e}`);
-          return { success: false, error: String(e) };
-        }
-      }
-      case '_agent/skill/create': {
-        const skillName = params['name'] as string | undefined;
-        if (!skillName) return { success: false, error: 'Missing name param' };
-        try {
-          const { Storage } = await import('@google/gemini-cli-core');
-          const path = await import('path');
-          const fs = await import('fs/promises');
-
-          const skillsDir = path.join(Storage.getGlobalAgentsDir() || path.join((await import('os')).homedir(), '.agents'), 'skills', skillName); await fs.mkdir(skillsDir, { recursive: true });
-
-          const skillPath = path.join(skillsDir, 'SKILL.md');
-          const defaultContent = `---
-description: A short description of what ${skillName} does.
----
-
-# ${skillName}
-
-## Instructions
-Describe how the agent should use this skill here.
-
-## References
-- You can add URLs or local file paths here.
-`;
-          try {
-            await fs.access(skillPath);
-          } catch {
-            await fs.writeFile(skillPath, defaultContent, 'utf8');
-          }
-
-          await this.config.reloadSkills();
-          return { success: true, path: skillPath };
-        } catch (e) {
-          debugLogger.error(`[ACP] Failed to create skill ${skillName}: ${e}`);
-          return { success: false, error: String(e) };
-        }
-      }
-      case '_agent/skill/delete': {
-        const skillName = params['name'] as string | undefined;
-        if (!skillName) return { success: false, error: 'Missing name param' };
-        try {
-          const { Storage } = await import('@google/gemini-cli-core');
-          const path = await import('path');
-          const fs = await import('fs/promises');
-          const skillsDir = path.join(Storage.getGlobalAgentsDir() || path.join((await import('os')).homedir(), '.agents'), 'skills', skillName);
-          await fs.rm(skillsDir, { recursive: true, force: true });
-
-          await this.config.reloadSkills();
-          return { success: true };
-        } catch (e) {
-          debugLogger.error(`[ACP] Failed to delete skill ${skillName}: ${e}`);
-          return { success: false, error: String(e) };
-        }
-      }
-      case '_agent/skill/export': {
-        const skillName = params['name'] as string | undefined;
-        if (!skillName) return { success: false, error: 'Missing name param' };
-        try {
-          const { Storage } = await import('@google/gemini-cli-core');
-          const path = await import('path');
-          const fs = await import('fs/promises');
-          const os = await import('os');
-
-          // Search in multiple skill locations
-          const searchDirs = [
-            path.join(Storage.getGlobalAgentsDir() || path.join(os.homedir(), '.agents'), 'skills'),
-            path.join(Storage.getGlobalGeminiDir(), 'skills'),
-          ];
-
-          let skillDir: string | null = null;
-          for (const dir of searchDirs) {
-            const candidate = path.join(dir, skillName);
-            try {
-              await fs.access(candidate);
-              skillDir = candidate;
-              break;
-            } catch { /* not found, try next */ }
-          }
-
-          if (!skillDir) {
-            return { success: false, error: `Skill '${skillName}' not found` };
-          }
-
-          // Read all files in the skill directory
-          const files: Record<string, string> = {};
-          const entries = await fs.readdir(skillDir, { withFileTypes: true });
-          for (const entry of entries) {
-            if (entry.isFile()) {
-              const content = await fs.readFile(path.join(skillDir, entry.name), 'utf8');
-              files[entry.name] = content;
-            }
-          }
-
-          return {
-            success: true,
-            name: skillName,
-            files,
-            skillMd: files['SKILL.md'] || null,
-          };
-        } catch (e) {
-          debugLogger.error(`[ACP] Failed to export skill ${skillName}: ${e}`);
-          return { success: false, error: String(e) };
-        }
-      }
-      case '_agent/mcp/delete': {
-        const mcpName = params['name'] as string | undefined;
-        if (!mcpName) return { success: false, error: 'Missing mcp name' };
-        try {
-          const { Storage } = await import('@google/gemini-cli-core');
-          const path = await import('path');
-          const fs = await import('fs/promises');
-          const settingsPath = path.join(Storage.getGlobalGeminiDir(), 'settings.json'); let settingsObj: any = {};
-          try {
-            const data = await fs.readFile(settingsPath, 'utf8');
-            settingsObj = JSON.parse(data);
-          } catch (e) { }
-
-          if (settingsObj.mcp && settingsObj.mcp.servers && settingsObj.mcp.servers[mcpName]) {
-            delete settingsObj.mcp.servers[mcpName];
-            await fs.writeFile(settingsPath, JSON.stringify(settingsObj, null, 2), 'utf8');
-          }
-          return { success: true };
-        } catch (e) {
-          debugLogger.error(`[ACP] Failed to delete mcp ${mcpName}: ${e}`);
-          return { success: false, error: String(e) };
-        }
-      }
-      case '_agent/mcp/toggle': {
-        const mcpName = params['name'] as string | undefined;
-        const enable = params['enable'] as boolean | undefined;
-        if (!mcpName || enable === undefined) return { success: false, error: 'Missing mcp name or enable param' };
-        try {
-          const { Storage } = await import('@google/gemini-cli-core');
-          const path = await import('path');
-          const fs = await import('fs/promises');
-          const settingsPath = path.join(Storage.getGlobalGeminiDir(), 'mcp-server-enablement.json'); let settingsObj: any = {};
-          try {
-            const data = await fs.readFile(settingsPath, 'utf8');
-            settingsObj = JSON.parse(data);
-          } catch (e) { }
-
-          const normalizedName = mcpName.toLowerCase().trim();
-          if (enable) {
-            if (normalizedName in settingsObj) {
-              delete settingsObj[normalizedName];
-            }
-          } else {
-            settingsObj[normalizedName] = { enabled: false };
-          }
-          await fs.writeFile(settingsPath, JSON.stringify(settingsObj, null, 2), 'utf8');
-          return { success: true };
-        } catch (e) {
-          debugLogger.error(`[ACP] Failed to toggle mcp ${mcpName}: ${e}`);
-          return { success: false, error: String(e) };
-        }
-      }
-      case '_models/list': {
-        const models: Array<{ id: string, name: string }> = [];
-        if (VALID_GEMINI_MODELS) {
-          for (const modelId of VALID_GEMINI_MODELS) {
-            const nameParts = modelId.split('-');
-            const capitalizedName = nameParts.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
-            models.push({ id: modelId, name: capitalizedName });
-          }
-        } else if (DEFAULT_MODEL_CONFIGS?.aliases) {
-          for (const [key, val] of Object.entries(DEFAULT_MODEL_CONFIGS.aliases)) {
-            if (key.startsWith('gemini-') && !key.endsWith('-base')) {
-              const modelId = (val as any).modelConfig?.model || key;
-              models.push({ id: modelId, name: key });
-            }
-          }
-        }
-        if (models.length === 0) {
-          models.push({ id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' });
-          models.push({ id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' });
-        }
-
-        const uniqueModels = Array.from(new Map(models.map(m => [m.id, m])).values());
-        return { models: uniqueModels };
-      }
-      default:
-        throw new acp.RequestError(404, `Method not found: ${method}`);
-    }
+    return session.setModel(params.modelId);
   }
 }
 
 export class Session {
   private pendingPrompt: AbortController | null = null;
+  private commandHandler = new CommandHandler();
 
   constructor(
     private readonly id: string,
     private readonly chat: GeminiChat,
     private readonly config: Config,
     private readonly connection: acp.AgentSideConnection,
-  ) { }
+    private readonly settings: LoadedSettings,
+  ) {}
+
   async cancelPendingPrompt(): Promise<void> {
     if (!this.pendingPrompt) {
       throw new Error('Not currently generating');
@@ -828,21 +493,6 @@ export class Session {
 
     this.pendingPrompt.abort();
     this.pendingPrompt = null;
-  }
-
-  async clear(preserveSummary?: string | null): Promise<void> {
-    this.chat.setHistory([]);
-    if (preserveSummary) {
-      this.chat.addHistory({
-        role: 'user',
-        parts: [{ text: preserveSummary }],
-      });
-      // Also add an empty model response so the turn ends correctly
-      this.chat.addHistory({
-        role: 'model',
-        parts: [{ text: 'Context cleared and summary preserved.' }],
-      });
-    }
   }
 
   setMode(modeId: acp.SessionModeId): acp.SetSessionModeResponse {
@@ -856,28 +506,25 @@ export class Session {
     return {};
   }
 
-  setModel(modelId: string): void {
-    // Determine if the model exists in our known aliases/models
-    const isKnownModel = buildAvailableModels().some(m => m.modelId === modelId);
-    if (!isKnownModel) {
-      // It might be a custom or fallback model; we still allow setting it,
-      // but maybe warn or just proceed since models might be dynamically loaded.
-      debugLogger.warn(`Setting unknown or unverified model: ${modelId}`);
-    }
-    // Make it the active model for this session
-    this.config.setModel(modelId, false);
+  private getAvailableCommands() {
+    return this.commandHandler.getAvailableCommands();
   }
 
-  setConfigOption(configId: string, value: unknown): acp.SetSessionConfigOptionResponse {
-    if (configId === 'model' && typeof value === 'string') {
-      this.setModel(value);
-      debugLogger.warn(`[ACP] Config option ${configId} set to ${value}`);
-    } else {
-      debugLogger.warn(`[ACP] Unsupported config option: ${configId}=${String(value)}`);
-    }
-    return {
-      configOptions: buildAvailableConfigOptions(this.config.getModel())
-    };
+  async sendAvailableCommands(): Promise<void> {
+    const availableCommands = this.getAvailableCommands().map((command) => ({
+      name: command.name,
+      description: command.description,
+    }));
+
+    await this.sendUpdate({
+      sessionUpdate: 'available_commands_update',
+      availableCommands,
+    });
+  }
+
+  setModel(modelId: acp.ModelId): acp.SetSessionModelResponse {
+    this.config.setModel(modelId);
+    return {};
   }
 
   async streamHistory(messages: ConversationRecord['messages']): Promise<void> {
@@ -941,7 +588,6 @@ export class Session {
                   ? 'completed'
                   : 'failed',
               title: toolCall.displayName || toolCall.name,
-              rawInput: toolCall.args,
               content: toolCallContent,
               kind: tool ? toAcpToolKind(tool.kind) : 'other',
             });
@@ -951,102 +597,54 @@ export class Session {
     }
   }
 
-  /**
-   * Handle ACP slash commands locally (ACP spec: /command sent via session/prompt).
-   * Returns PromptResponse if handled, or null to fall through to normal LLM processing.
-   */
-  async #handleSlashCommand(text: string): Promise<acp.PromptResponse | null> {
-    const spaceIdx = text.indexOf(' ');
-    const command = (spaceIdx > 0 ? text.slice(1, spaceIdx) : text.slice(1)).toLowerCase();
-    const args = spaceIdx > 0 ? text.slice(spaceIdx + 1).trim() : '';
-
-    switch (command) {
-      case 'clear': {
-        await this.clear();
-        await this.#sendCommandResponse('Conversation history cleared.');
-        return { stopReason: 'end_turn' };
-      }
-
-      case 'model': {
-        if (!args) {
-          const currentModel = this.config.getModel();
-          const available = buildAvailableModels().map((m) => m.modelId).join(', ');
-          await this.#sendCommandResponse(
-            `Current model: **${currentModel}**\nAvailable: ${available}`,
-          );
-        } else {
-          this.setModel(args);
-          await this.#sendCommandResponse(`Model switched to **${args}**`);
-        }
-        return { stopReason: 'end_turn' };
-      }
-
-      case 'tools': {
-        await this.#sendCommandResponse(
-          'Use the `/tools` command in the terminal CLI to list available tools and MCP servers.',
-        );
-        return { stopReason: 'end_turn' };
-      }
-
-      case 'stats': {
-        await this.#sendCommandResponse('Token usage stats are not available in ACP mode yet.');
-        return { stopReason: 'end_turn' };
-      }
-
-      case 'plan': {
-        if (this.config.isPlanEnabled()) {
-          return null; // Fall through to LLM with plan prompt
-        }
-        await this.#sendCommandResponse('Plan mode is not enabled for this session.');
-        return { stopReason: 'end_turn' };
-      }
-
-      default:
-        return null; // Unknown command — fall through to LLM
-    }
-  }
-
-  /**
-   * Send a short agent response for slash command results (no LLM call needed).
-   */
-  async #sendCommandResponse(message: string): Promise<void> {
-    await this.sendUpdate({
-      sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: message },
-    } as unknown as acp.SessionNotification['update']);
-  }
-
   async prompt(params: acp.PromptRequest): Promise<acp.PromptResponse> {
     this.pendingPrompt?.abort();
     const pendingSend = new AbortController();
     this.pendingPrompt = pendingSend;
 
-    // ── Slash command interception (ACP spec: /command sent via session/prompt) ──
-    const promptText = params.prompt
-      .filter((block): block is { type: 'text'; text: string } => 'type' in block && block.type === 'text')
-      .map((block) => block.text)
-      .join('')
-      .trim();
-
-    if (promptText.startsWith('/')) {
-      const result = await this.#handleSlashCommand(promptText);
-      if (result !== null) {
-        return result;
-      }
-      // Not a recognized command — fall through to normal LLM processing
-    }
+    await this.config.waitForMcpInit();
 
     const promptId = Math.random().toString(16).slice(2);
     const chat = this.chat;
 
     const parts = await this.#resolvePrompt(params.prompt, pendingSend.signal);
 
-    let nextMessage: Content | null = { role: 'user', parts };
+    // Command interception
+    let commandText = '';
 
-    // Accumulate token usage across the entire prompt turn (may have multiple
-    // LLM round-trips when tool calls happen).
-    let totalInputTokens = 0;
-    let totalOutputTokens = 0;
+    for (const part of parts) {
+      if (typeof part === 'object' && part !== null) {
+        if ('text' in part) {
+          // It is a text part
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-type-assertion
+          const text = (part as any).text;
+          if (typeof text === 'string') {
+            commandText += text;
+          }
+        } else {
+          // Non-text part (image, embedded resource)
+          // Stop looking for command
+          break;
+        }
+      }
+    }
+
+    commandText = commandText.trim();
+
+    if (
+      commandText &&
+      (commandText.startsWith('/') || commandText.startsWith('$'))
+    ) {
+      // If we found a command, pass it to handleCommand
+      // Note: handleCommand currently expects `commandText` to be the command string
+      // It uses `parts` argument but effectively ignores it in current implementation
+      const handled = await this.handleCommand(commandText, parts);
+      if (handled) {
+        return { stopReason: 'end_turn' };
+      }
+    }
+
+    let nextMessage: Content | null = { role: 'user', parts };
 
     while (nextMessage !== null) {
       if (pendingSend.signal.aborted) {
@@ -1101,13 +699,6 @@ export class Session {
             }
           }
 
-          // Capture usageMetadata from each chunk (last one has final counts)
-          if (resp.type === StreamEventType.CHUNK && resp.value.usageMetadata) {
-            const meta = resp.value.usageMetadata;
-            totalInputTokens = meta.promptTokenCount ?? totalInputTokens;
-            totalOutputTokens = meta.candidatesTokenCount ?? totalOutputTokens;
-          }
-
           if (resp.type === StreamEventType.CHUNK && resp.value.functionCalls) {
             functionCalls.push(...resp.value.functionCalls);
           }
@@ -1149,50 +740,37 @@ export class Session {
       }
     }
 
-    // Send token usage notification in the same format that Codex uses,
-    // so the frontend extNotification handler can display it without changes.
-    if (totalInputTokens > 0 || totalOutputTokens > 0) {
-      const totalTokens = totalInputTokens + totalOutputTokens;
-      // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      this.connection.extNotification('thread/tokenUsage/updated', {
-        tokenUsage: {
-          total: {
-            inputTokens: totalInputTokens,
-            outputTokens: totalOutputTokens,
-            totalTokens,
-            cachedInputTokens: 0,
-            reasoningOutputTokens: 0,
-          },
-        },
-      });
-    }
-
     return { stopReason: 'end_turn' };
   }
 
-  private async sendUpdate(
-    update: acp.SessionNotification['update'],
-  ): Promise<void> {
-    // Diagnostic: verify rawInput is present before SDK serialization
-    if ('sessionUpdate' in update && (update as Record<string, unknown>)['sessionUpdate'] === 'tool_call') {
-      const u = update as Record<string, unknown>;
-      process.stderr.write(`[sendUpdate] tool_call id=${String(u['toolCallId'])} hasRawInput=${'rawInput' in u && u['rawInput'] != null} rawInputType=${typeof u['rawInput']}\n`);
-    }
+  private async handleCommand(
+    commandText: string,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    parts: Part[],
+  ): Promise<boolean> {
+    const gitService = await this.config.getGitService();
+    const commandContext = {
+      config: this.config,
+      settings: this.settings,
+      git: gitService,
+      sendMessage: async (text: string) => {
+        await this.sendUpdate({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text },
+        });
+      },
+    };
+
+    return this.commandHandler.handleCommand(commandText, commandContext);
+  }
+
+  private async sendUpdate(update: acp.SessionUpdate): Promise<void> {
     const params: acp.SessionNotification = {
       sessionId: this.id,
       update,
     };
 
     await this.connection.sessionUpdate(params);
-  }
-
-  async sendAvailableCommands(config: Config): Promise<void> {
-    const commands = buildAvailableSlashCommands(config);
-    if (commands.length === 0) return;
-    await this.sendUpdate({
-      sessionUpdate: 'available_commands_update',
-      availableCommands: commands,
-    } as unknown as acp.SessionNotification['update']);
   }
 
   private async runTool(
@@ -1259,24 +837,18 @@ export class Session {
         if (confirmationDetails.type === 'edit') {
           content.push({
             type: 'diff',
-            path: confirmationDetails.fileName,
+            path: confirmationDetails.filePath,
             oldText: confirmationDetails.originalContent,
             newText: confirmationDetails.newContent,
+            _meta: {
+              kind: !confirmationDetails.originalContent
+                ? 'add'
+                : confirmationDetails.newContent === ''
+                  ? 'delete'
+                  : 'modify',
+            },
           });
         }
-
-        // ACP spec: send tool_call notification BEFORE requestPermission
-        // so clients can display rawInput immediately.
-        await this.sendUpdate({
-          sessionUpdate: 'tool_call',
-          toolCallId: callId,
-          status: 'pending',
-          title: invocation.getDescription(),
-          rawInput: args,
-          content,
-          locations: invocation.toolLocations(),
-          kind: toAcpToolKind(tool.kind),
-        });
 
         const params: acp.RequestPermissionRequest = {
           sessionId: this.id,
@@ -1285,7 +857,6 @@ export class Session {
             toolCallId: callId,
             status: 'pending',
             title: invocation.getDescription(),
-            rawInput: args,
             content,
             locations: invocation.toolLocations(),
             kind: toAcpToolKind(tool.kind),
@@ -1298,8 +869,8 @@ export class Session {
           output.outcome.outcome === CoreToolCallStatus.Cancelled
             ? ToolConfirmationOutcome.Cancel
             : z
-              .nativeEnum(ToolConfirmationOutcome)
-              .parse(output.outcome.optionId);
+                .nativeEnum(ToolConfirmationOutcome)
+                .parse(output.outcome.optionId);
 
         await confirmationDetails.onConfirm(outcome);
 
@@ -1326,7 +897,6 @@ export class Session {
           toolCallId: callId,
           status: 'in_progress',
           title: invocation.getDescription(),
-          rawInput: args,
           content: [],
           locations: invocation.toolLocations(),
           kind: toAcpToolKind(tool.kind),
@@ -1795,9 +1365,18 @@ function toToolCallContent(toolResult: ToolResult): acp.ToolCallContent | null {
       if ('fileName' in toolResult.returnDisplay) {
         return {
           type: 'diff',
-          path: toolResult.returnDisplay.fileName,
+          path:
+            toolResult.returnDisplay.filePath ??
+            toolResult.returnDisplay.fileName,
           oldText: toolResult.returnDisplay.originalContent,
           newText: toolResult.returnDisplay.newContent,
+          _meta: {
+            kind: !toolResult.returnDisplay.originalContent
+              ? 'add'
+              : toolResult.returnDisplay.newContent === ''
+                ? 'delete'
+                : 'modify',
+          },
         };
       }
       return null;
@@ -1886,14 +1465,18 @@ function toAcpToolKind(kind: Kind): acp.ToolKind {
   switch (kind) {
     case Kind.Read:
     case Kind.Edit:
+    case Kind.Execute:
+    case Kind.Search:
     case Kind.Delete:
     case Kind.Move:
-    case Kind.Search:
-    case Kind.Execute:
     case Kind.Think:
     case Kind.Fetch:
+    case Kind.SwitchMode:
     case Kind.Other:
       return kind as acp.ToolKind;
+    case Kind.Agent:
+      return 'think';
+    case Kind.Plan:
     case Kind.Communicate:
     default:
       return 'other';
@@ -1930,85 +1513,93 @@ function buildAvailableModes(isPlanEnabled: boolean): acp.SessionMode[] {
   return modes;
 }
 
-function buildAvailableModels(): acp.ModelInfo[] {
-  const models: acp.ModelInfo[] = [];
-  if (VALID_GEMINI_MODELS) {
-    for (const modelId of VALID_GEMINI_MODELS) {
-      const nameParts = modelId.split('-');
-      const capitalizedName = nameParts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
-      models.push({ modelId: modelId, name: capitalizedName });
-    }
-  } else if (DEFAULT_MODEL_CONFIGS?.aliases) {
-    for (const [key, val] of Object.entries(DEFAULT_MODEL_CONFIGS.aliases)) {
-      if (key.startsWith('gemini-') && !key.endsWith('-base')) {
-        const modelId = (val as any).modelConfig?.model || key;
-        models.push({ modelId: modelId, name: key });
-      }
-    }
-  }
-  if (models.length === 0) {
-    models.push({ modelId: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' });
-    models.push({ modelId: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' });
-  }
+function buildAvailableModels(
+  config: Config,
+  settings: LoadedSettings,
+): {
+  availableModels: Array<{
+    modelId: string;
+    name: string;
+    description?: string;
+  }>;
+  currentModelId: string;
+} {
+  const preferredModel = config.getModel() || DEFAULT_GEMINI_MODEL_AUTO;
+  const shouldShowPreviewModels = config.getHasAccessToPreviewModel();
+  const useGemini31 = config.getGemini31LaunchedSync?.() ?? false;
+  const selectedAuthType = settings.merged.security.auth.selectedType;
+  const useCustomToolModel =
+    useGemini31 && selectedAuthType === AuthType.USE_GEMINI;
 
-  return Array.from(new Map(models.map((m) => [m.modelId, m])).values());
-}
-
-function buildAvailableConfigOptions(currentModel?: string): acp.SessionConfigOption[] {
-  const options: acp.SessionConfigOption[] = [];
-
-  // Model selection (category: "model")
-  const models = buildAvailableModels();
-  if (models.length > 0) {
-    // Use the configured model if provided, otherwise fall back to first available
-    const effectiveModel = (currentModel && models.some(m => m.modelId === currentModel))
-      ? currentModel
-      : models[0]!.modelId;
-    options.push({
-      id: 'model',
-      name: 'Model',
-      description: 'Active Gemini model',
-      type: 'select',
-      category: 'model',
-      currentValue: effectiveModel,
-      options: models.map((m) => ({
-        value: m.modelId,
-        name: m.name ?? m.modelId,
-      })),
-    });
-  }
-
-  return options;
-}
-
-function buildAvailableSlashCommands(config: Config): acp.AvailableCommand[] {
-  const commands: acp.AvailableCommand[] = [
+  const mainOptions = [
     {
-      name: 'clear',
-      description: 'Clear the current conversation history',
-    },
-    {
-      name: 'model',
-      description: 'Switch the active Gemini model',
-      input: { hint: 'model name (e.g. gemini-2.5-pro)' },
-    },
-    {
-      name: 'tools',
-      description: 'List available tools and MCP servers',
-    },
-    {
-      name: 'stats',
-      description: 'Show token usage and session statistics',
+      value: DEFAULT_GEMINI_MODEL_AUTO,
+      title: getDisplayString(DEFAULT_GEMINI_MODEL_AUTO),
+      description:
+        'Let Gemini CLI decide the best model for the task: gemini-2.5-pro, gemini-2.5-flash',
     },
   ];
 
-  if (config.isPlanEnabled()) {
-    commands.push({
-      name: 'plan',
-      description: 'Create a detailed implementation plan',
-      input: { hint: 'description of what to plan' },
+  if (shouldShowPreviewModels) {
+    mainOptions.unshift({
+      value: PREVIEW_GEMINI_MODEL_AUTO,
+      title: getDisplayString(PREVIEW_GEMINI_MODEL_AUTO),
+      description: useGemini31
+        ? 'Let Gemini CLI decide the best model for the task: gemini-3.1-pro, gemini-3-flash'
+        : 'Let Gemini CLI decide the best model for the task: gemini-3-pro, gemini-3-flash',
     });
   }
 
-  return commands;
+  const manualOptions = [
+    {
+      value: DEFAULT_GEMINI_MODEL,
+      title: getDisplayString(DEFAULT_GEMINI_MODEL),
+    },
+    {
+      value: DEFAULT_GEMINI_FLASH_MODEL,
+      title: getDisplayString(DEFAULT_GEMINI_FLASH_MODEL),
+    },
+    {
+      value: DEFAULT_GEMINI_FLASH_LITE_MODEL,
+      title: getDisplayString(DEFAULT_GEMINI_FLASH_LITE_MODEL),
+    },
+  ];
+
+  if (shouldShowPreviewModels) {
+    const previewProModel = useGemini31
+      ? PREVIEW_GEMINI_3_1_MODEL
+      : PREVIEW_GEMINI_MODEL;
+
+    const previewProValue = useCustomToolModel
+      ? PREVIEW_GEMINI_3_1_CUSTOM_TOOLS_MODEL
+      : previewProModel;
+
+    manualOptions.unshift(
+      {
+        value: previewProValue,
+        title: getDisplayString(previewProModel),
+      },
+      {
+        value: PREVIEW_GEMINI_FLASH_MODEL,
+        title: getDisplayString(PREVIEW_GEMINI_FLASH_MODEL),
+      },
+    );
+  }
+
+  const scaleOptions = (
+    options: Array<{ value: string; title: string; description?: string }>,
+  ) =>
+    options.map((o) => ({
+      modelId: o.value,
+      name: o.title,
+      description: o.description,
+    }));
+
+  return {
+    availableModels: [
+      ...scaleOptions(mainOptions),
+      ...scaleOptions(manualOptions),
+    ],
+    currentModelId: preferredModel,
+  };
 }

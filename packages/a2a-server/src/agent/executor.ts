@@ -12,25 +12,24 @@ import type {
   RequestContext,
   ExecutionEventBus,
 } from '@a2a-js/sdk/server';
-import type { ToolCallRequestInfo, Config } from '@google/gemini-cli-core';
 import {
   GeminiEventType,
   SimpleExtensionLoader,
+  type ToolCallRequestInfo,
+  type Config,
 } from '@google/gemini-cli-core';
 import { v4 as uuidv4 } from 'uuid';
 
 import { logger } from '../utils/logger.js';
-import type {
-  StateChange,
-  AgentSettings,
-  PersistedStateMetadata,
-  ToolCallUpdate,
-} from '../types.js';
 import {
   CoderAgentEvent,
-  CODER_AGENT_METADATA_KEY,
   getPersistedState,
   setPersistedState,
+  type StateChange,
+  type AgentSettings,
+  type PersistedStateMetadata,
+  getContextIdFromMetadata,
+  getAgentSettingsFromMetadata,
 } from '../types.js';
 import { loadConfig, loadEnvironment, setTargetDir } from '../config/config.js';
 import { loadSettings } from '../config/settings.js';
@@ -119,8 +118,7 @@ export class CoderAgentExecutor implements AgentExecutor {
     const agentSettings = persistedState._agentSettings;
     const config = await this.getConfig(agentSettings, sdkTask.id);
     const contextId: string =
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-      (metadata['_contextId'] as string) || sdkTask.contextId;
+      getContextIdFromMetadata(metadata) || sdkTask.contextId;
     const runtimeTask = await Task.create(
       sdkTask.id,
       contextId,
@@ -143,8 +141,10 @@ export class CoderAgentExecutor implements AgentExecutor {
     agentSettingsInput?: AgentSettings,
     eventBus?: ExecutionEventBus,
   ): Promise<TaskWrapper> {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-    const agentSettings = agentSettingsInput || ({} as AgentSettings);
+    const agentSettings: AgentSettings = agentSettingsInput || {
+      kind: CoderAgentEvent.StateAgentSettingsEvent,
+      workspacePath: process.cwd(),
+    };
     const config = await this.getConfig(agentSettings, taskId);
     const runtimeTask = await Task.create(
       taskId,
@@ -294,8 +294,7 @@ export class CoderAgentExecutor implements AgentExecutor {
     const contextId: string =
       userMessage.contextId ||
       sdkTask?.contextId ||
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-      (sdkTask?.metadata?.['_contextId'] as string) ||
+      getContextIdFromMetadata(sdkTask?.metadata) ||
       uuidv4();
 
     logger.info(
@@ -384,16 +383,13 @@ export class CoderAgentExecutor implements AgentExecutor {
             } as Message,
           },
           final: true,
-          metadata: { [CODER_AGENT_METADATA_KEY]: stateChange },
+          metadata: { coderAgent: stateChange },
         });
         return;
       }
     } else {
       logger.info(`[CoderAgentExecutor] Creating new task ${taskId}.`);
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-      const agentSettings = userMessage.metadata?.[
-        CODER_AGENT_METADATA_KEY
-      ] as AgentSettings;
+      const agentSettings = getAgentSettingsFromMetadata(userMessage.metadata);
       try {
         wrapper = await this.createTask(
           taskId,
@@ -499,18 +495,6 @@ export class CoderAgentExecutor implements AgentExecutor {
           logger.info(
             `[CoderAgentExecutor] Task ${taskId}: Found ${toolCallRequests.length} tool call requests. Scheduling as a batch.`,
           );
-
-          // Publish tool-call-update events for each tool call (started)
-          for (const req of toolCallRequests) {
-            const toolUpdate: ToolCallUpdate = {
-              kind: CoderAgentEvent.ToolCallUpdateEvent,
-              toolName: req.name,
-              toolCallId: req.callId,
-              status: 'started',
-            };
-            currentTask.setTaskStateAndPublishUpdate('working', toolUpdate);
-          }
-
           await currentTask.scheduleToolCalls(toolCallRequests, abortSignal);
         }
 
@@ -527,49 +511,6 @@ export class CoderAgentExecutor implements AgentExecutor {
         const completedTools = currentTask.getAndClearCompletedTools();
 
         if (completedTools.length > 0) {
-          // Note: _schedulerToolCallsUpdate in task.ts now handles
-          // publishing tool-call-update SSE events with toolName/status/responseText.
-          // This loop is only reached via _schedulerAllToolCallsComplete path
-          // (batch completions). Publish here as well for completeness.
-          for (const tool of completedTools) {
-            let responseText = '';
-            if ('response' in tool && tool.response) {
-              if (tool.response.resultDisplay) {
-                responseText = String(tool.response.resultDisplay);
-              }
-              if (!responseText && tool.response.responseParts) {
-                for (const p of tool.response.responseParts) {
-                  if ('text' in p && typeof p.text === 'string') {
-                    responseText += p.text;
-                  } else {
-                    const pAny = p as Record<string, unknown>;
-                    if (pAny['functionResponse']) {
-                      const fr = pAny['functionResponse'] as Record<string, unknown>;
-                      const frResp = fr['response'] as Record<string, unknown> | undefined;
-                      if (frResp && typeof frResp['output'] === 'string') {
-                        responseText += frResp['output'] as string;
-                      }
-                    }
-                  }
-                }
-              }
-              if (!responseText && tool.response.data) {
-                const output = tool.response.data['output'];
-                if (typeof output === 'string') {
-                  responseText = output;
-                }
-              }
-            }
-            const toolUpdate: ToolCallUpdate = {
-              kind: CoderAgentEvent.ToolCallUpdateEvent,
-              toolName: tool.request.name,
-              toolCallId: tool.request.callId,
-              status: tool.status === 'cancelled' ? 'failed' : 'completed',
-              responseText: responseText || undefined,
-            };
-            currentTask.setTaskStateAndPublishUpdate('working', toolUpdate);
-          }
-
           // If all completed tool calls were canceled, manually add them to history and set state to input-required, final:true
           if (completedTools.every((tool) => tool.status === 'cancelled')) {
             logger.info(
