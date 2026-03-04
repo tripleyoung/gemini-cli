@@ -23,6 +23,7 @@ import {
   fetchAdminControlsOnce,
   getCodeAssistServer,
   ExperimentFlags,
+  MCPServerConfig,
   type TelemetryTarget,
   type ConfigParameters,
   type ExtensionLoader,
@@ -36,6 +37,7 @@ export async function loadConfig(
   settings: Settings,
   extensionLoader: ExtensionLoader,
   taskId: string,
+  agentSettings?: AgentSettings,
 ): Promise<Config> {
   const workspaceDir = process.cwd();
   const adcFilePath = process.env['GOOGLE_APPLICATION_CREDENTIALS'];
@@ -74,7 +76,13 @@ export async function loadConfig(
       process.env['GEMINI_YOLO_MODE'] === 'true'
         ? ApprovalMode.YOLO
         : ApprovalMode.DEFAULT,
-    mcpServers: settings.mcpServers,
+    mcpServers: agentSettings?.mcpServers
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+      ? mergeMcpServers(settings.mcpServers, agentSettings.mcpServers as any[])
+      : settings.mcpServers,
+    adminSkillsEnabled: agentSettings?.adminSkillsEnabled ?? settings.adminSkillsEnabled,
+    disabledSkills: agentSettings?.disabledSkills ?? settings.disabledSkills,
+    extraSkillsDirs: agentSettings?.extraSkillsDirs,
     cwd: workspaceDir,
     telemetry: {
       enabled: settings.telemetry?.enabled,
@@ -173,7 +181,6 @@ export async function loadConfig(
   // Needed to initialize ToolRegistry, and git checkpointing if enabled
   await config.initialize();
 
-  await config.waitForMcpInit();
   startupProfiler.flush(config);
 
   await refreshAuthentication(config, adcFilePath, 'Config');
@@ -273,4 +280,43 @@ async function refreshAuthentication(
     logger.error(errorMessage);
     throw new Error(errorMessage);
   }
+}
+
+function mergeMcpServers(
+  existingConfigs: Record<string, MCPServerConfig> | undefined,
+  acpServers: any[],
+): Record<string, MCPServerConfig> {
+  const merged = { ...existingConfigs };
+
+  for (const server of acpServers) {
+    if (!server || !server.name) {
+      continue;
+    }
+
+    if (server.type === 'stdio') {
+      const stdioServer = server as {
+        name: string;
+        command: string;
+        args?: string[];
+        env?: { name: string; value: string }[];
+      };
+
+      const envMap: Record<string, string> = {};
+      if (stdioServer.env) {
+        for (const e of stdioServer.env) {
+          envMap[e.name] = e.value;
+        }
+      }
+
+      // Create new config using the positional arguments constructor
+      const newConfig = new MCPServerConfig(
+        stdioServer.command,
+        stdioServer.args || [],
+        Object.keys(envMap).length > 0 ? envMap : undefined,
+      );
+      merged[stdioServer.name] = newConfig;
+    }
+  }
+
+  return merged;
 }

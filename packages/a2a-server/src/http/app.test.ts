@@ -469,6 +469,7 @@ describe('E2E Tests', () => {
       .expect(200);
 
     const events = streamToSSEEvents(res.text);
+    console.log('RES_TEXT:', res.text);
     assertTaskCreationAndWorkingStatus(events);
 
     // --- Assert the sequential execution flow ---

@@ -58,6 +58,11 @@ export interface AgentSettings {
   kind: CoderAgentEvent.StateAgentSettingsEvent;
   workspacePath: string;
   autoExecute?: boolean;
+  mcpServers?: any[]; // Array of ACP McpServer objects
+  adminSkillsEnabled?: boolean;
+  disabledSkills?: string[];
+  /** Additional directories to discover SKILL.md files from (e.g., brain/skills/) */
+  extraSkillsDirs?: string[];
 }
 
 export interface ToolCallConfirmation {

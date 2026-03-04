@@ -101,6 +101,11 @@ export const DOCS_PARAM_PATH = 'path';
 export const ACTIVATE_SKILL_TOOL_NAME = 'activate_skill';
 export const SKILL_PARAM_NAME = 'name';
 
+// -- learn_skill --
+export const LEARN_SKILL_TOOL_NAME = 'learn_skill';
+export const LEARN_SKILL_PARAM_DESCRIPTION = 'description';
+export const LEARN_SKILL_PARAM_INSTRUCTIONS = 'instructions';
+
 // -- ask_user --
 export const ASK_USER_TOOL_NAME = 'ask_user';
 export const ASK_USER_PARAM_QUESTIONS = 'questions';

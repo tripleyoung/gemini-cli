@@ -5,6 +5,9 @@
  */
 
 import express, { type Request } from 'express';
+import { spawn, type ChildProcess } from 'node:child_process';
+import * as path from 'node:path';
+import { createInterface } from 'node:readline';
 
 import type { AgentCard, Message } from '@a2a-js/sdk';
 import {
@@ -238,14 +241,109 @@ export async function createApp() {
       agentExecutor,
     );
 
+    // ── Admin JSON-RPC handlers (reused by both JSON-RPC middleware & REST compat) ──
+    const handleAdminReloadAgents = async () => {
+      logger.info('[CoreAgent] Reloading agent registry...');
+      const agentRegistry = config.getAgentRegistry();
+      await agentRegistry.reload();
+      config.refreshSubAgentTools();
+      const agents = agentRegistry.getAllDefinitions();
+      const agentNames = agents.map((a) => a.name);
+
+      if (childProcess) {
+        logger.info('[CoreAgent] Restarting ACP bridge to apply new agents...');
+        childProcess.kill();
+        childProcess = null;
+        spawnAcpBridge();
+      }
+
+      logger.info(
+        `[CoreAgent] Agent registry reloaded. Agents: ${agentNames.join(', ')}`,
+      );
+      return { reloaded: true, agents: agentNames };
+    };
+
+    const handleAdminAddDirectory = async (directory: string, discoverSkills = true) => {
+      const resolvedDir = path.resolve(directory);
+      logger.info(`[CoreAgent] Adding directory to workspace: ${resolvedDir}`);
+      config.getWorkspaceContext().addDirectory(resolvedDir);
+
+      let skillsDiscovered = 0;
+      if (discoverSkills) {
+        const { existsSync } = await import('node:fs');
+        const skillsDir = path.join(resolvedDir, 'skills');
+        if (existsSync(skillsDir)) {
+          logger.info(`[CoreAgent] Re-discovering skills from: ${skillsDir}`);
+          const skillManager = config.getSkillManager();
+          await skillManager.discoverSkills(
+            config.storage,
+            config.getExtensions(),
+            config.isTrustedFolder(),
+            [skillsDir],
+          );
+          skillsDiscovered = skillManager.getSkills().length;
+        }
+      }
+      return { added: resolvedDir, skillsDiscovered };
+    };
+
+    // ── JSON-RPC admin/* middleware — intercept before SDK routes ──
     let expressApp = express();
     expressApp.use((req, res, next) => {
       requestStorage.run({ req }, next);
     });
+    expressApp.use(express.json());
+    expressApp.post('/', async (req, res, next) => {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const body = req.body;
+      if (body?.jsonrpc !== '2.0' || typeof body?.method !== 'string') {
+        return next(); // Not JSON-RPC or missing method — pass to SDK
+      }
+      const method = body.method as string;
+      if (!method.startsWith('admin/')) {
+        return next(); // Not an admin method — pass to SDK
+      }
+
+      const id = body.id ?? null;
+      try {
+        switch (method) {
+          case 'admin/reloadAgents': {
+            const result = await handleAdminReloadAgents();
+            return res.json({ jsonrpc: '2.0', id, result });
+          }
+          case 'admin/addDirectory': {
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+            const params = body.params ?? {};
+            const directory = params?.directory as string | undefined;
+            if (!directory) {
+              return res.json({
+                jsonrpc: '2.0', id,
+                error: { code: -32602, message: 'Missing "directory" param' },
+              });
+            }
+            const discoverSkills = params?.discoverSkills !== false;
+            const result = await handleAdminAddDirectory(directory, discoverSkills);
+            return res.json({ jsonrpc: '2.0', id, result });
+          }
+          default:
+            return res.json({
+              jsonrpc: '2.0', id,
+              error: { code: -32601, message: `Method not found: ${method}` },
+            });
+        }
+      } catch (error) {
+        logger.error(`[CoreAgent] Error in ${method}:`, error);
+        const errorMessage =
+          error instanceof Error ? error.message : `Unknown error in ${method}`;
+        return res.json({
+          jsonrpc: '2.0', id,
+          error: { code: -32000, message: errorMessage },
+        });
+      }
+    });
 
     const appBuilder = new A2AExpressApp(requestHandler, customUserBuilder);
     expressApp = appBuilder.setupRoutes(expressApp, '');
-    expressApp.use(express.json());
 
     expressApp.post('/tasks', async (req, res) => {
       try {
@@ -361,6 +459,117 @@ export async function createApp() {
         return;
       }
       res.json({ metadata: await wrapper.task.getMetadata() });
+    });
+
+    // ── REST compat endpoint for /reload-agents ──
+    expressApp.post('/reload-agents', async (_req, res) => {
+      try {
+        const result = await handleAdminReloadAgents();
+        res.status(200).json(result);
+      } catch (error) {
+        logger.error('[CoreAgent] Error reloading agents:', error);
+        const errorMessage =
+          error instanceof Error
+            ? error.message
+            : 'Unknown error reloading agents';
+        res.status(500).json({ error: errorMessage });
+      }
+    });
+
+    // --- Raw ACP HTTP Bridge logic ---
+    let childProcess: ChildProcess | null = null;
+    let sseClients: express.Response[] = [];
+
+    const spawnAcpBridge = () => {
+      if (childProcess) return;
+      const spawnArgs = ['--experimental-acp'];
+      const model = (process.env['CODER_AGENT_MODEL'] || process.env['GEMINI_MODEL'] || '').trim();
+      if (model) spawnArgs.push('--model', model);
+      const env = { ...process.env, A2A_SERVER: 'true', GEMINI_YOLO_MODE: 'true' };
+
+      logger.info(`Spawning gemini ${spawnArgs.join(' ')} for ACP bridging`);
+      const bundlePath = path.resolve(__dirname, '../../../../bundle/gemini.js');
+
+      childProcess = spawn(process.execPath, [bundlePath, ...spawnArgs], {
+        stdio: ['pipe', 'pipe', 'inherit'],
+        env
+      });
+
+      childProcess?.on('error', (err: Error) => {
+        logger.error(`Failed to spawn ACP child process: ${err.message}`);
+      });
+
+      if (childProcess?.stdout) {
+        const rl = createInterface({ input: childProcess.stdout });
+        rl.on('line', (line: string) => {
+          if (!line.trim()) return;
+          try {
+            const data = JSON.parse(line);
+            // Diagnostic: check rawInput in subprocess output
+            if (data?.params?.update?.sessionUpdate === 'tool_call') {
+              const hasRaw = 'rawInput' in (data.params.update || {});
+              logger.info(`[ACP Bridge] tool_call id=${data.params?.update?.toolCallId} hasRawInput=${hasRaw}`);
+            }
+            const ssePayload = `data: ${JSON.stringify(data)}\n\n`;
+            for (const client of sseClients) {
+              client.write(ssePayload);
+            }
+          } catch (e) {
+            logger.error("Invalid JSON from child:", line);
+          }
+        });
+      }
+
+      childProcess?.on('exit', () => {
+        logger.info("ACP Child process exited");
+        childProcess = null;
+        for (const client of sseClients) {
+          client.end();
+        }
+        sseClients = [];
+      });
+    };
+
+    // Eagerly spawn it so there's no cold start
+    spawnAcpBridge();
+
+    expressApp.post('/shutdown', (req, res) => {
+      logger.info("Received /shutdown request");
+      if (childProcess) childProcess.kill();
+      res.status(200).send("OK");
+      setTimeout(() => process.exit(0), 100);
+    });
+
+    expressApp.post('/acp', (req, res) => {
+      if (!childProcess || !childProcess.stdin) {
+        return res.status(500).json({ error: "Agent not connected" });
+      }
+      const payload = JSON.stringify(req.body) + "\n";
+      childProcess.stdin.write(payload);
+      return res.status(200).send("");
+    });
+
+    expressApp.get('/acp/stream', (req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      res.write(': connected\n\n');
+      res.write('event: endpoint\ndata: /acp\n\n');
+      sseClients.push(res);
+
+      const keepAliveInterval = setInterval(() => {
+        res.write(': keepalive\n\n');
+      }, 15000);
+
+      spawnAcpBridge();
+
+      req.on('close', () => {
+        clearInterval(keepAliveInterval);
+        sseClients = sseClients.filter(c => c !== res);
+        logger.info("An SSE client disconnected. Active clients: " + sseClients.length);
+      });
     });
     return expressApp;
   } catch (error) {

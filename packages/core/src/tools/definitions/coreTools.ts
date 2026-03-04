@@ -91,6 +91,9 @@ export {
   PLAN_MODE_PARAM_REASON,
   EXIT_PLAN_PARAM_PLAN_PATH,
   SKILL_PARAM_NAME,
+  LEARN_SKILL_TOOL_NAME,
+  LEARN_SKILL_PARAM_DESCRIPTION,
+  LEARN_SKILL_PARAM_INSTRUCTIONS,
 } from './base-declarations.js';
 
 // Re-export sets for compatibility

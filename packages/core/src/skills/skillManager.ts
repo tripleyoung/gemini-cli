@@ -48,6 +48,7 @@ export class SkillManager {
     storage: Storage,
     extensions: GeminiCLIExtension[] = [],
     isTrusted: boolean = false,
+    extraDirs: string[] = [],
   ): Promise<void> {
     this.clearSkills();
 
@@ -70,6 +71,12 @@ export class SkillManager {
       Storage.getUserAgentSkillsDir(),
     );
     this.addSkillsWithPrecedence(userAgentSkills);
+
+    // 3.2 Extra skills directories (e.g., brain/skills/)
+    for (const dir of extraDirs) {
+      const extraSkills = await loadSkillsFromDir(dir);
+      this.addSkillsWithPrecedence(extraSkills);
+    }
 
     // 4. Workspace skills (highest precedence)
     if (!isTrusted) {

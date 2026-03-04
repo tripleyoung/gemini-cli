@@ -32,7 +32,6 @@ import {
   PREVIEW_GEMINI_3_1_MODEL,
 } from '../config/models.js';
 import { PreCompressTrigger } from '../hooks/types.js';
-import { LlmRole } from '../telemetry/types.js';
 
 /**
  * Default threshold for compression token count as a fraction of the model's

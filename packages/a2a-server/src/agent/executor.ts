@@ -30,6 +30,7 @@ import {
   type PersistedStateMetadata,
   getContextIdFromMetadata,
   getAgentSettingsFromMetadata,
+  type ToolCallUpdate,
 } from '../types.js';
 import { loadConfig, loadEnvironment, setTargetDir } from '../config/config.js';
 import { loadSettings } from '../config/settings.js';
@@ -96,7 +97,7 @@ export class CoderAgentExecutor implements AgentExecutor {
     loadEnvironment(); // Will override any global env with workspace envs
     const settings = loadSettings(workspaceRoot);
     const extensions = loadExtensions(workspaceRoot);
-    return loadConfig(settings, new SimpleExtensionLoader(extensions), taskId);
+    return loadConfig(settings, new SimpleExtensionLoader(extensions), taskId, agentSettings);
   }
 
   /**
@@ -511,6 +512,49 @@ export class CoderAgentExecutor implements AgentExecutor {
         const completedTools = currentTask.getAndClearCompletedTools();
 
         if (completedTools.length > 0) {
+          // Note: _schedulerToolCallsUpdate in task.ts now handles
+          // publishing tool-call-update SSE events with toolName/status/responseText.
+          // This loop is only reached via _schedulerAllToolCallsComplete path
+          // (batch completions). Publish here as well for completeness.
+          for (const tool of completedTools) {
+            let responseText = '';
+            if ('response' in tool && tool.response) {
+              if (tool.response.resultDisplay) {
+                const res = tool.response.resultDisplay;
+                responseText = typeof res === 'object' ? JSON.stringify(res) : String(res);
+              }
+              if (!responseText && tool.response.responseParts) {
+                for (const p of tool.response.responseParts) {
+                  if ('text' in p && typeof p.text === 'string') {
+                    responseText += p.text;
+                  } else {
+                    const pAny = p as Record<string, unknown>;
+                    if (pAny['functionResponse']) {
+                      const fr = pAny['functionResponse'] as Record<string, unknown>;
+                      const frResp = fr['response'] as Record<string, unknown> | undefined;
+                      if (frResp && typeof frResp['output'] === 'string') {
+                        responseText += frResp['output'] as string;
+                      }
+                    }
+                  }
+                }
+              }
+              if (!responseText && tool.response.data) {
+                const output = tool.response.data['output'];
+                if (typeof output === 'string') {
+                  responseText = output;
+                }
+              }
+            }
+            const toolUpdate: ToolCallUpdate = {
+              kind: CoderAgentEvent.ToolCallUpdateEvent,
+              toolName: tool.request.name,
+              toolCallId: tool.request.callId,
+              status: tool.status === 'cancelled' ? 'failed' : 'completed',
+              responseText: responseText || undefined,
+            };
+            currentTask.setTaskStateAndPublishUpdate('working', toolUpdate);
+          }
           // If all completed tool calls were canceled, manually add them to history and set state to input-required, final:true
           if (completedTools.every((tool) => tool.status === 'cancelled')) {
             logger.info(

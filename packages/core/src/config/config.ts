@@ -26,6 +26,7 @@ import { GrepTool } from '../tools/grep.js';
 import { canUseRipgrep, RipGrepTool } from '../tools/ripGrep.js';
 import { GlobTool } from '../tools/glob.js';
 import { ActivateSkillTool } from '../tools/activate-skill.js';
+import { LearnSkillTool } from '../tools/learn-skill.js';
 import { EditTool } from '../tools/edit.js';
 import { ShellTool } from '../tools/shell.js';
 import { WriteFileTool } from '../tools/write-file.js';
@@ -577,6 +578,8 @@ export interface ConfigParameters {
   skillsSupport?: boolean;
   disabledSkills?: string[];
   adminSkillsEnabled?: boolean;
+  /** Additional directories to scan for SKILL.md files (e.g., brain/skills/) */
+  extraSkillsDirs?: string[];
   experimentalJitContext?: boolean;
   toolOutputMasking?: Partial<ToolOutputMaskingConfig>;
   disableLLMCorrection?: boolean;
@@ -790,6 +793,7 @@ export class Config implements McpContext {
   private readonly skillsSupport: boolean;
   private disabledSkills: string[];
   private readonly adminSkillsEnabled: boolean;
+  private readonly extraSkillsDirs: string[];
 
   private readonly experimentalJitContext: boolean;
   private readonly disableLLMCorrection: boolean;
@@ -891,6 +895,7 @@ export class Config implements McpContext {
     this.skillsSupport = params.skillsSupport ?? true;
     this.disabledSkills = params.disabledSkills ?? [];
     this.adminSkillsEnabled = params.adminSkillsEnabled ?? true;
+    this.extraSkillsDirs = params.extraSkillsDirs ?? [];
     this.modelAvailabilityService = new ModelAvailabilityService();
     this.experimentalJitContext = params.experimentalJitContext ?? false;
     this.modelSteering = params.modelSteering ?? false;
@@ -1175,6 +1180,7 @@ export class Config implements McpContext {
           this.storage,
           this.getExtensions(),
           this.isTrustedFolder(),
+          this.extraSkillsDirs,
         );
         this.getSkillManager().setDisabledSkills(this.disabledSkills);
 
@@ -2815,6 +2821,9 @@ export class Config implements McpContext {
     );
     maybeRegister(ActivateSkillTool, () =>
       registry.registerTool(new ActivateSkillTool(this, this.messageBus)),
+    );
+    maybeRegister(LearnSkillTool, () =>
+      registry.registerTool(new LearnSkillTool(this, this.messageBus)),
     );
     maybeRegister(EditTool, () =>
       registry.registerTool(new EditTool(this, this.messageBus)),

@@ -45,6 +45,9 @@ export interface Settings {
     enableRecursiveFileSearch?: boolean;
     customIgnoreFilePaths?: string[];
   };
+
+  adminSkillsEnabled?: boolean;
+  disabledSkills?: string[];
 }
 
 export interface SettingsError {

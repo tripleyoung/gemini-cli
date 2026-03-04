@@ -30,7 +30,6 @@ import {
 import {
   AgentStartEvent,
   AgentFinishEvent,
-  LlmRole,
   RecoveryAttemptEvent,
   LlmRole,
 } from '../telemetry/types.js';

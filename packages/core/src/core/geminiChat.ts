@@ -53,7 +53,6 @@ import {
   createAvailabilityContextProvider,
 } from '../availability/policyHelpers.js';
 import { coreEvents } from '../utils/events.js';
-import type { LlmRole } from '../telemetry/types.js';
 
 export enum StreamEventType {
   /** A regular content chunk from the API. */
