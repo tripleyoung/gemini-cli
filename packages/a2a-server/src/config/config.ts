@@ -315,6 +315,27 @@ function mergeMcpServers(
         Object.keys(envMap).length > 0 ? envMap : undefined,
       );
       merged[stdioServer.name] = newConfig;
+    } else if (server.uri || server.url || server.httpUrl) {
+      // SSE or Streamable HTTP transport
+      const rawUrl: string = server.uri || server.url || server.httpUrl;
+      // Strip sse:// protocol prefix → http:// for actual connection
+      const cleanUrl = rawUrl.replace(/^sse:\/\//, 'http://');
+      const transport: string = server.transport || server.type || 'sse';
+      const isSse = transport === 'sse';
+
+      const newConfig = new MCPServerConfig(
+        undefined,  // command (stdio only)
+        undefined,  // args
+        undefined,  // env
+        undefined,  // cwd
+        isSse ? cleanUrl : undefined,   // url (SSE transport)
+        !isSse ? cleanUrl : undefined,  // httpUrl (Streamable HTTP)
+        undefined,  // headers
+        undefined,  // tcp
+        isSse ? 'sse' : 'http',         // type
+      );
+      merged[server.name] = newConfig;
+      logger.info(`[MCP-Merge] Added ${transport} MCP server '${server.name}' at ${cleanUrl}`);
     }
   }
 
