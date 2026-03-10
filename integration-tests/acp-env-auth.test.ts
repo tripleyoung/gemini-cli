@@ -59,7 +59,7 @@ describe.skip('ACP Environment and Auth', () => {
 
       const bundlePath = join(import.meta.dirname, '..', 'bundle/gemini.js');
 
-      child = spawn('node', [bundlePath, '--experimental-acp'], {
+      child = spawn('node', [bundlePath, '--acp'], {
         cwd: rig.homeDir!,
         stdio: ['pipe', 'pipe', 'inherit'],
         env: {
@@ -124,7 +124,7 @@ describe.skip('ACP Environment and Auth', () => {
 
       const bundlePath = join(import.meta.dirname, '..', 'bundle/gemini.js');
 
-      child = spawn('node', [bundlePath, '--experimental-acp'], {
+      child = spawn('node', [bundlePath, '--acp'], {
         cwd: rig.homeDir!,
         stdio: ['pipe', 'pipe', 'inherit'],
         env: {
