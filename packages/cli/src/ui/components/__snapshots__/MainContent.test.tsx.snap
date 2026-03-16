@@ -66,69 +66,6 @@ exports[`MainContent > MainContent Tool Output Height Logic > 'Normal mode - Unc
 ╭──────────────────────────────────────────────────────────────────────────────────────────────╮
 │ ⊶  Shell Command Running a long command...                                                   │
 │                                                                                              │
-│ Line 10                                                                                      │
-│ Line 11                                                                                      │
-│ Line 12                                                                                      │
-│ Line 13                                                                                      │
-│ Line 14                                                                                      │
-│ Line 15                                                                                    █ │
-│ Line 16                                                                                    █ │
-│ Line 17                                                                                    █ │
-│ Line 18                                                                                    █ │
-│ Line 19                                                                                    █ │
-│ Line 20                                                                                    █ │
-╰──────────────────────────────────────────────────────────────────────────────────────────────╯
-ShowMoreLines
-"
-`;
-
-exports[`MainContent > MainContent Tool Output Height Logic > 'ASB mode - Unfocused shell' 1`] = `
-"ScrollableList
-AppHeader(full)
-╭──────────────────────────────────────────────────────────────────────────────────────────────╮
-│ ⊷  Shell Command Running a long command...                                                   │
-│                                                                                              │
-│ Line 10                                                                                      │
-│ Line 11                                                                                      │
-│ Line 12                                                                                      │
-│ Line 13                                                                                      │
-│ Line 14                                                                                      │
-│ Line 15                                                                                    █ │
-│ Line 16                                                                                    █ │
-│ Line 17                                                                                    █ │
-│ Line 18                                                                                    █ │
-│ Line 19                                                                                    █ │
-│ Line 20                                                                                    █ │
-╰──────────────────────────────────────────────────────────────────────────────────────────────╯
-ShowMoreLines
-"
-`;
-
-exports[`MainContent > MainContent Tool Output Height Logic > 'Normal mode - Constrained height' 1`] = `
-"AppHeader(full)
-╭──────────────────────────────────────────────────────────────────────────────────────────────╮
-│ ⊷  Shell Command Running a long command...                                                   │
-│                                                                                              │
-│ ... first 11 lines hidden ...                                                                │
-│ Line 12                                                                                      │
-│ Line 13                                                                                      │
-│ Line 14                                                                                      │
-│ Line 15                                                                                      │
-│ Line 16                                                                                      │
-│ Line 17                                                                                      │
-│ Line 18                                                                                      │
-│ Line 19                                                                                      │
-│ Line 20                                                                                      │
-╰──────────────────────────────────────────────────────────────────────────────────────────────╯
-ShowMoreLines
-"
-`;
-
-exports[`MainContent > MainContent Tool Output Height Logic > 'Normal mode - Unconstrained height' 1`] = `
-"AppHeader(full)
-╭──────────────────────────────────────────────────────────────────────────────────────────────╮
-│ ⊷  Shell Command Running a long command...                                                   │
-│                                                                                              │
 │ Line 1                                                                                       │
 │ Line 2                                                                                       │
 │ Line 3                                                                                       │

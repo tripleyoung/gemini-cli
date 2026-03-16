@@ -62,6 +62,7 @@ export async function loadConfig(
 
   const configParams: ConfigParameters = {
     sessionId: taskId,
+    clientName: 'a2a-server',
     model: PREVIEW_GEMINI_MODEL,
     embeddingModel: DEFAULT_GEMINI_EMBEDDING_MODEL,
     sandbox: undefined, // Sandbox might not be relevant for a server-side agent
@@ -108,13 +109,7 @@ export async function loadConfig(
     checkpointing,
     interactive: !isHeadlessMode(),
     enableInteractiveShell: !isHeadlessMode(),
-    enableAgents: true, // Enable user/project agent discovery (peer agents in team mode)
     ptyInfo: 'auto',
-    // Allow additional workspace directories via environment variable
-    // (e.g., brain dir for artifact storage, passed by ilhae-proxy spawn)
-    includeDirectories: process.env['CODER_AGENT_INCLUDE_DIRS']
-      ? process.env['CODER_AGENT_INCLUDE_DIRS'].split(path.delimiter).filter(Boolean)
-      : undefined,
   };
 
   const fileService = new FileDiscoveryService(workspaceDir, {
