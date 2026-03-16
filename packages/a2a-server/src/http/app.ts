@@ -19,6 +19,7 @@ import { A2AExpressApp, type UserBuilder } from '@a2a-js/sdk/server/express'; //
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../utils/logger.js';
 import type { AgentSettings } from '../types.js';
+import { TOOL_CALL_REPORTING_EXT_URI } from '../types.js';
 import { GCSTaskStore, NoOpTaskStore } from '../persistence/gcs.js';
 import { CoderAgentExecutor } from '../agent/executor.js';
 import { requestStorage } from './requestStorage.js';
@@ -45,16 +46,29 @@ const coderAgentCard: AgentCard = {
   description:
     'An agent that generates code based on natural language instructions and streams file outputs.',
   url: 'http://localhost:41242/',
+  preferredTransport: 'HTTP+JSON',
+  additionalInterfaces: [
+    {
+      url: 'http://localhost:41242/',
+      transport: 'JSONRPC',
+    },
+  ],
   provider: {
     organization: 'Google',
     url: 'https://google.com',
   },
-  protocolVersion: '0.3.0',
-  version: '0.0.2', // Incremented version
+  protocolVersion: '1.0',
+  version: '0.0.3',
   capabilities: {
     streaming: true,
     pushNotifications: false,
-    stateTransitionHistory: true,
+    extensions: [
+      {
+        uri: TOOL_CALL_REPORTING_EXT_URI,
+        description:
+          'Reports tool call events (confirmation requests, status updates) as extension metadata.',
+      },
+    ],
   },
   securitySchemes: {
     bearerAuth: {
@@ -89,6 +103,11 @@ const coderAgentCard: AgentCard = {
 
 export function updateCoderAgentCardUrl(port: number) {
   coderAgentCard.url = `http://localhost:${port}/`;
+  if (coderAgentCard.additionalInterfaces) {
+    for (const iface of coderAgentCard.additionalInterfaces) {
+      iface.url = `http://localhost:${port}/`;
+    }
+  }
 }
 
 const customUserBuilder: UserBuilder = async (req: Request) => {
