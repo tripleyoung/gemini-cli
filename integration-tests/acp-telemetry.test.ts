@@ -62,7 +62,7 @@ describe('ACP telemetry', () => {
       'node',
       [
         bundlePath,
-        '--experimental-acp',
+        '--acp',
         '--fake-responses',
         join(rig.testDir!, 'fake-responses.json'),
       ],
@@ -76,7 +76,6 @@ describe('ACP telemetry', () => {
           GEMINI_TELEMETRY_ENABLED: 'true',
           GEMINI_TELEMETRY_TARGET: 'local',
           GEMINI_TELEMETRY_OUTFILE: telemetryPath,
-          // GEMINI_DEV_TRACING not set: fake responses aren't instrumented for spans
         },
       },
     );

@@ -4,24 +4,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import express from 'express';
-import { spawn, type ChildProcess } from 'node:child_process';
-import { createInterface } from 'node:readline';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import express, { type Request } from 'express';
 
 import type { AgentCard, Message } from '@a2a-js/sdk';
-import type { TaskStore } from '@a2a-js/sdk/server';
 import {
+  type TaskStore,
   DefaultRequestHandler,
   InMemoryTaskStore,
-  InMemoryPushNotificationStore,
-  DefaultPushNotificationSender,
-  DefaultExecutionEventBusManager,
   DefaultExecutionEventBus,
   type AgentExecutionEvent,
+  UnauthenticatedUser,
 } from '@a2a-js/sdk/server';
-import { A2AExpressApp } from '@a2a-js/sdk/server/express'; // Import server components
+import { A2AExpressApp, type UserBuilder } from '@a2a-js/sdk/server/express'; // Import server components
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../utils/logger.js';
 import type { AgentSettings } from '../types.js';
@@ -32,9 +26,12 @@ import { loadConfig, loadEnvironment, setTargetDir } from '../config/config.js';
 import { loadSettings } from '../config/settings.js';
 import { loadExtensions } from '../config/extension.js';
 import { commandRegistry } from '../commands/command-registry.js';
-import { debugLogger, SimpleExtensionLoader } from '@google/gemini-cli-core';
+import {
+  debugLogger,
+  SimpleExtensionLoader,
+  GitService,
+} from '@google/gemini-cli-core';
 import type { Command, CommandArgument } from '../commands/types.js';
-import { GitService } from '@google/gemini-cli-core';
 
 type CommandResponse = {
   name: string;
@@ -43,24 +40,10 @@ type CommandResponse = {
   subCommands: CommandResponse[];
 };
 
-const a2aBearerToken = process.env['A2A_BEARER_TOKEN']?.trim();
-const a2aAuthEnabled = Boolean(a2aBearerToken);
-const a2aSecuritySchemes = a2aAuthEnabled
-  ? {
-    bearerAuth: {
-      type: 'http' as const,
-      scheme: 'bearer',
-      description: 'Bearer token required for A2A endpoints',
-    },
-  }
-  : undefined;
-const a2aSecurityRequirements = a2aAuthEnabled ? [{ bearerAuth: [] }] : undefined;
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
 const coderAgentCard: AgentCard = {
-  name: process.env['AGENT_CARD_NAME'] || 'Gemini Agent',
+  name: 'Gemini SDLC Agent',
   description:
-    process.env['AGENT_CARD_DESCRIPTION'] || 'An AI coding agent powered by Gemini CLI.',
+    'An agent that generates code based on natural language instructions and streams file outputs.',
   url: 'http://localhost:41242/',
   provider: {
     organization: 'Google',
@@ -70,11 +53,20 @@ const coderAgentCard: AgentCard = {
   version: '0.0.2', // Incremented version
   capabilities: {
     streaming: true,
-    pushNotifications: true,
+    pushNotifications: false,
     stateTransitionHistory: true,
   },
-  securitySchemes: a2aSecuritySchemes,
-  security: a2aSecurityRequirements,
+  securitySchemes: {
+    bearerAuth: {
+      type: 'http',
+      scheme: 'bearer',
+    },
+    basicAuth: {
+      type: 'http',
+      scheme: 'basic',
+    },
+  },
+  security: [{ bearerAuth: [] }, { basicAuth: [] }],
   defaultInputModes: ['text'],
   defaultOutputModes: ['text'],
   skills: [
@@ -92,12 +84,41 @@ const coderAgentCard: AgentCard = {
       outputModes: ['text'],
     },
   ],
-  supportsAuthenticatedExtendedCard: a2aAuthEnabled,
+  supportsAuthenticatedExtendedCard: false,
 };
 
 export function updateCoderAgentCardUrl(port: number) {
   coderAgentCard.url = `http://localhost:${port}/`;
 }
+
+const customUserBuilder: UserBuilder = async (req: Request) => {
+  const auth = req.headers['authorization'];
+  if (auth) {
+    const scheme = auth.split(' ')[0];
+    logger.info(
+      `[customUserBuilder] Received Authorization header with scheme: ${scheme}`,
+    );
+  }
+  if (!auth) return new UnauthenticatedUser();
+
+  // 1. Bearer Auth
+  if (auth.startsWith('Bearer ')) {
+    const token = auth.substring(7);
+    if (token === 'valid-token') {
+      return { userName: 'bearer-user', isAuthenticated: true };
+    }
+  }
+
+  // 2. Basic Auth
+  if (auth.startsWith('Basic ')) {
+    const credentials = Buffer.from(auth.substring(6), 'base64').toString();
+    if (credentials === 'admin:password') {
+      return { userName: 'basic-user', isAuthenticated: true };
+    }
+  }
+
+  return new UnauthenticatedUser();
+};
 
 async function handleExecuteCommand(
   req: express.Request,
@@ -109,6 +130,7 @@ async function handleExecuteCommand(
   },
 ) {
   logger.info('[CoreAgent] Received /executeCommand request: ', req.body);
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
   const { command, args } = req.body;
   try {
     if (typeof command !== 'string') {
@@ -210,41 +232,18 @@ export async function createApp() {
 
     const context = { config, git, agentExecutor };
 
-    // Wire up A2A Push Notification support (spec Section 3.5.3)
-    const eventBusManager = new DefaultExecutionEventBusManager();
-    const pushNotificationStore = new InMemoryPushNotificationStore();
-    const pushNotificationSender = new DefaultPushNotificationSender(
-      pushNotificationStore,
-    );
-
     const requestHandler = new DefaultRequestHandler(
       coderAgentCard,
       taskStoreForHandler,
       agentExecutor,
-      eventBusManager,
-      pushNotificationStore,
-      pushNotificationSender,
-      coderAgentCard,
     );
 
     let expressApp = express();
     expressApp.use((req, res, next) => {
       requestStorage.run({ req }, next);
     });
-    if (a2aBearerToken) {
-      expressApp.use((req, res, next) => {
-        const authHeader = req.header('authorization');
-        if (authHeader === `Bearer ${a2aBearerToken}`) {
-          return next();
-        }
-        res.setHeader('WWW-Authenticate', 'Bearer realm="a2a-server"');
-        return res.status(401).json({
-          error: 'Missing or invalid bearer token',
-        });
-      });
-    }
 
-    const appBuilder = new A2AExpressApp(requestHandler);
+    const appBuilder = new A2AExpressApp(requestHandler, customUserBuilder);
     expressApp = appBuilder.setupRoutes(expressApp, '');
     expressApp.use(express.json());
 
@@ -255,6 +254,7 @@ export async function createApp() {
         const agentSettings = req.body.agentSettings as
           | AgentSettings
           | undefined;
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         const contextId = req.body.contextId || uuidv4();
         const wrapper = await agentExecutor.createTask(
           taskId,
@@ -362,134 +362,6 @@ export async function createApp() {
       }
       res.json({ metadata: await wrapper.task.getMetadata() });
     });
-
-    expressApp.post('/reload-agents', async (_req, res) => {
-      try {
-        logger.info('[CoreAgent] Reloading agent registry...');
-        const agentRegistry = config.getAgentRegistry();
-        await agentRegistry.reload();
-        // Re-register the reloaded agents as tools so the LLM can invoke them
-        config.refreshSubAgentTools();
-        const agents = agentRegistry.getAllDefinitions();
-        const agentNames = agents.map((a) => a.name);
-
-        // Kill and respawn ACP bridge so the child process also reloads agents!
-        if (childProcess) {
-          logger.info('[CoreAgent] Restarting ACP bridge to apply new agents...');
-          childProcess.kill();
-          childProcess = null;
-          spawnAcpBridge();
-        }
-
-        logger.info(
-          `[CoreAgent] Agent registry reloaded. Agents: ${agentNames.join(', ')}`,
-        );
-        res.status(200).json({ reloaded: true, agents: agentNames });
-      } catch (error) {
-        logger.error('[CoreAgent] Error reloading agents:', error);
-        const errorMessage =
-          error instanceof Error
-            ? error.message
-            : 'Unknown error reloading agents';
-        res.status(500).json({ error: errorMessage });
-      }
-    });
-
-    // --- Raw ACP HTTP Bridge logic ---
-    let childProcess: ChildProcess | null = null;
-    let sseClients: express.Response[] = [];
-
-    const spawnAcpBridge = () => {
-      if (childProcess) return;
-      const spawnArgs = ['--experimental-acp'];
-      const model = (process.env['CODER_AGENT_MODEL'] || process.env['GEMINI_MODEL'] || '').trim();
-      if (model) spawnArgs.push('--model', model);
-      const env = { ...process.env, A2A_SERVER: 'true', GEMINI_YOLO_MODE: 'true' };
-
-      logger.info(`Spawning gemini ${spawnArgs.join(' ')} for ACP bridging`);
-      const bundlePath = path.resolve(__dirname, '../../../bundle/gemini.js');
-
-      childProcess = spawn(process.execPath, [bundlePath, ...spawnArgs], {
-        stdio: ['pipe', 'pipe', 'inherit'],
-        env
-      });
-
-      childProcess?.on('error', (err: Error) => {
-        logger.error(`Failed to spawn ACP child process: ${err.message}`);
-      });
-
-      if (childProcess?.stdout) {
-        const rl = createInterface({ input: childProcess.stdout });
-        rl.on('line', (line: string) => {
-          if (!line.trim()) return;
-          try {
-            const data = JSON.parse(line);
-            // Diagnostic: check rawInput in subprocess output
-            if (data?.params?.update?.sessionUpdate === 'tool_call') {
-              const hasRaw = 'rawInput' in (data.params.update || {});
-              logger.info(`[ACP Bridge] tool_call id=${data.params?.update?.toolCallId} hasRawInput=${hasRaw}`);
-            }
-            const ssePayload = `data: ${JSON.stringify(data)}\n\n`;
-            for (const client of sseClients) {
-              client.write(ssePayload);
-            }
-          } catch (e) {
-            logger.error("Invalid JSON from child:", line);
-          }
-        });
-      }
-
-      childProcess?.on('exit', () => {
-        logger.info("ACP Child process exited");
-        childProcess = null;
-        for (const client of sseClients) {
-          client.end();
-        }
-        sseClients = [];
-      });
-    };
-
-    // Eagerly spawn it so there's no cold start
-    spawnAcpBridge();
-
-    expressApp.post('/shutdown', (req, res) => {
-      logger.info("Received /shutdown request");
-      if (childProcess) childProcess.kill();
-      res.status(200).send("OK");
-      setTimeout(() => process.exit(0), 100);
-    });
-
-    expressApp.post('/acp', (req, res) => {
-      if (!childProcess || !childProcess.stdin) {
-        return res.status(500).json({ error: "Agent not connected" });
-      }
-      const payload = JSON.stringify(req.body) + "\n";
-      childProcess.stdin.write(payload);
-      return res.status(200).send("");
-    });
-
-    expressApp.get('/acp/stream', (req, res) => {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-      });
-      res.write(': connected\n\n');
-      sseClients.push(res);
-
-      const keepAliveInterval = setInterval(() => {
-        res.write(': keepalive\n\n');
-      }, 15000);
-
-      spawnAcpBridge();
-
-      req.on('close', () => {
-        clearInterval(keepAliveInterval);
-        sseClients = sseClients.filter(c => c !== res);
-        logger.info("An SSE client disconnected. Active clients: " + sseClients.length);
-      });
-    });
-
     return expressApp;
   } catch (error) {
     logger.error('[CoreAgent] Error during startup:', error);

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import yaml from 'js-yaml';
+import { load } from 'js-yaml';
 import * as fs from 'node:fs/promises';
 import { type Dirent } from 'node:fs';
 import * as path from 'node:path';
@@ -44,24 +44,30 @@ interface FrontmatterLocalAgentDefinition
  * Authentication configuration for remote agents in frontmatter format.
  */
 interface FrontmatterAuthConfig {
-  type: 'apiKey' | 'http';
-  agent_card_requires_auth?: boolean;
+  type: 'apiKey' | 'http' | 'google-credentials' | 'oauth2';
   // API Key
   key?: string;
   name?: string;
   // HTTP
-  scheme?: 'Bearer' | 'Basic';
+  scheme?: string;
   token?: string;
   username?: string;
   password?: string;
+  value?: string;
+  // Google Credentials
+  scopes?: string[];
+  // OAuth2
+  client_id?: string;
+  client_secret?: string;
+  authorization_url?: string;
+  token_url?: string;
 }
 
 interface FrontmatterRemoteAgentDefinition
   extends FrontmatterBaseAgentDefinition {
   kind: 'remote';
   description?: string;
-  agent_card_url?: string;
-  endpoint?: string;
+  agent_card_url: string;
   auth?: FrontmatterAuthConfig;
 }
 
@@ -102,9 +108,11 @@ const localAgentSchema = z
     display_name: z.string().optional(),
     tools: z
       .array(
-        z.string().refine((val) => isValidToolName(val), {
-          message: 'Invalid tool name',
-        }),
+        z
+          .string()
+          .refine((val) => isValidToolName(val, { allowWildcards: true }), {
+            message: 'Invalid tool name',
+          }),
       )
       .optional(),
     model: z.string().optional(),
@@ -117,9 +125,7 @@ const localAgentSchema = z
 /**
  * Base fields shared by all auth configs.
  */
-const baseAuthFields = {
-  agent_card_requires_auth: z.boolean().optional(),
-};
+const baseAuthFields = {};
 
 /**
  * API Key auth schema.
@@ -140,16 +146,49 @@ const apiKeyAuthSchema = z.object({
 const httpAuthSchema = z.object({
   ...baseAuthFields,
   type: z.literal('http'),
-  scheme: z.enum(['Bearer', 'Basic']),
+  scheme: z.string().min(1),
   token: z.string().min(1).optional(),
   username: z.string().min(1).optional(),
   password: z.string().min(1).optional(),
+  value: z.string().min(1).optional(),
+});
+
+/**
+ * Google Credentials auth schema.
+ */
+const googleCredentialsAuthSchema = z.object({
+  ...baseAuthFields,
+  type: z.literal('google-credentials'),
+  scopes: z.array(z.string()).optional(),
+});
+
+/**
+ * OAuth2 auth schema.
+ * authorization_url and token_url can be discovered from the agent card if omitted.
+ */
+const oauth2AuthSchema = z.object({
+  ...baseAuthFields,
+  type: z.literal('oauth2'),
+  client_id: z.string().optional(),
+  client_secret: z.string().optional(),
+  scopes: z.array(z.string()).optional(),
+  authorization_url: z.string().url().optional(),
+  token_url: z.string().url().optional(),
 });
 
 const authConfigSchema = z
-  .discriminatedUnion('type', [apiKeyAuthSchema, httpAuthSchema])
+  .discriminatedUnion('type', [
+    apiKeyAuthSchema,
+    httpAuthSchema,
+    googleCredentialsAuthSchema,
+    oauth2AuthSchema,
+  ])
   .superRefine((data, ctx) => {
     if (data.type === 'http') {
+      if (data.value) {
+        // Raw mode - only scheme and value are needed
+        return;
+      }
       if (data.scheme === 'Bearer' && !data.token) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -182,15 +221,10 @@ const remoteAgentSchema = z
     name: nameSchema,
     description: z.string().optional(),
     display_name: z.string().optional(),
-    agent_card_url: z.string().url().optional(),
-    endpoint: z.string().url().optional(),
+    agent_card_url: z.string().url(),
     auth: authConfigSchema.optional(),
   })
-  .strict()
-  .refine((data) => data.agent_card_url || data.endpoint, {
-    message: "Either 'agent_card_url' or 'endpoint' must be provided",
-    path: ["agent_card_url"],
-  });
+  .strict();
 
 // Use a Zod union to automatically discriminate between local and remote
 // agent types.
@@ -268,7 +302,7 @@ export async function parseAgentMarkdown(
 
   let rawFrontmatter: unknown;
   try {
-    rawFrontmatter = yaml.load(frontmatterStr);
+    rawFrontmatter = load(frontmatterStr);
   } catch (error) {
     throw new AgentLoadError(
       filePath,
@@ -332,9 +366,7 @@ export async function parseAgentMarkdown(
 function convertFrontmatterAuthToConfig(
   frontmatter: FrontmatterAuthConfig,
 ): A2AAuthConfig {
-  const base = {
-    agent_card_requires_auth: frontmatter.agent_card_requires_auth,
-  };
+  const base = {};
 
   switch (frontmatter.type) {
     case 'apiKey':
@@ -348,11 +380,26 @@ function convertFrontmatterAuthToConfig(
         name: frontmatter.name,
       };
 
+    case 'google-credentials':
+      return {
+        ...base,
+        type: 'google-credentials',
+        scopes: frontmatter.scopes,
+      };
+
     case 'http': {
       if (!frontmatter.scheme) {
         throw new Error(
           'Internal error: HTTP scheme missing after validation.',
         );
+      }
+      if (frontmatter.value) {
+        return {
+          ...base,
+          type: 'http',
+          scheme: frontmatter.scheme,
+          value: frontmatter.value,
+        };
       }
       switch (frontmatter.scheme) {
         case 'Bearer':
@@ -381,11 +428,22 @@ function convertFrontmatterAuthToConfig(
             password: frontmatter.password,
           };
         default: {
-          const exhaustive: never = frontmatter.scheme;
-          throw new Error(`Unknown HTTP scheme: ${exhaustive}`);
+          // Other IANA schemes without a value should not reach here after validation
+          throw new Error(`Unknown HTTP scheme: ${frontmatter.scheme}`);
         }
       }
     }
+
+    case 'oauth2':
+      return {
+        ...base,
+        type: 'oauth2',
+        client_id: frontmatter.client_id,
+        client_secret: frontmatter.client_secret,
+        scopes: frontmatter.scopes,
+        authorization_url: frontmatter.authorization_url,
+        token_url: frontmatter.token_url,
+      };
 
     default: {
       const exhaustive: never = frontmatter.type;
@@ -413,18 +471,6 @@ export function markdownToAgentDefinition(
           type: 'string',
           description: 'The task for the agent.',
         },
-        async: {
-          type: 'boolean',
-          description: 'If true, invokes the agent asynchronously and returns immediately. Recommended for tasks that can run in parallel or take a long time.',
-        },
-        subscribe: {
-          type: 'boolean',
-          description: 'If true, subscribes to the async task so that you receive an automatic callback via system interruption when the background task finishes. Requires async: true.',
-        },
-        sessionId: {
-          type: 'string',
-          description: 'Optional. To reuse or resume a specific conversational session with the agent, provide its session ID. Otherwise a new session is created or the latest one is reused automatically.',
-        },
       },
       // query is not required because it defaults to "Get Started!" if not provided
       required: [],
@@ -435,9 +481,9 @@ export function markdownToAgentDefinition(
     return {
       kind: 'remote',
       name: markdown.name,
-      description: markdown.description || '(Loading description...)',
+      description: markdown.description || '',
       displayName: markdown.display_name,
-      agentCardUrl: (markdown.agent_card_url || markdown.endpoint) as string,
+      agentCardUrl: markdown.agent_card_url,
       auth: markdown.auth
         ? convertFrontmatterAuthToConfig(markdown.auth)
         : undefined,
@@ -471,8 +517,8 @@ export function markdownToAgentDefinition(
     },
     toolConfig: markdown.tools
       ? {
-        tools: markdown.tools,
-      }
+          tools: markdown.tools,
+        }
       : undefined,
     inputConfig,
     metadata,
@@ -490,7 +536,6 @@ export function markdownToAgentDefinition(
 export async function loadAgentsFromDirectory(
   dir: string,
 ): Promise<AgentLoadResult> {
-  console.log(`[DEBUG] loadAgentsFromDirectory called for dir: ${dir}`);
   const result: AgentLoadResult = {
     agents: [],
     errors: [],
@@ -499,9 +544,7 @@ export async function loadAgentsFromDirectory(
   let dirEntries: Dirent[];
   try {
     dirEntries = await fs.readdir(dir, { withFileTypes: true });
-    console.log(`[DEBUG] loadAgentsFromDirectory found entries: ${dirEntries.map(e => e.name).join(', ')}`);
   } catch (error) {
-    console.error(`[DEBUG] loadAgentsFromDirectory error reading dir:`, error);
     // If directory doesn't exist, just return empty
     // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
