@@ -45,11 +45,11 @@ const coderAgentCard: AgentCard = {
   name: 'Gemini SDLC Agent',
   description:
     'An agent that generates code based on natural language instructions and streams file outputs.',
-  url: 'http://localhost:41242/',
+  url: 'http://localhost:0/',
   preferredTransport: 'HTTP+JSON',
   additionalInterfaces: [
     {
-      url: 'http://localhost:41242/',
+      url: 'http://localhost:0/',
       transport: 'JSONRPC',
     },
   ],
@@ -61,12 +61,25 @@ const coderAgentCard: AgentCard = {
   version: '0.0.3',
   capabilities: {
     streaming: true,
-    pushNotifications: false,
+    pushNotifications: true,
     extensions: [
       {
         uri: TOOL_CALL_REPORTING_EXT_URI,
         description:
           'Reports tool call events (confirmation requests, status updates) as extension metadata.',
+      },
+      {
+        uri: 'urn:ilhae:ext:file-output',
+        description:
+          'Streams file creation and modification events during code generation.',
+      },
+      {
+        uri: 'urn:ilhae:ext:thought-stream',
+        description: 'Streams intermediate reasoning and thinking process.',
+      },
+      {
+        uri: 'urn:ilhae:ext:progress',
+        description: 'Reports task progress percentage (0-100).',
       },
     ],
   },
@@ -408,7 +421,7 @@ export async function main() {
         `[CoreAgent] Agent Server started on http://localhost:${actualPort}`,
       );
       logger.info(
-        `[CoreAgent] Agent Card: http://localhost:${actualPort}/.well-known/agent-card.json`,
+        `[CoreAgent] Agent Card: http://localhost:${actualPort}/.well-known/agent.json`,
       );
       logger.info('[CoreAgent] Press Ctrl+C to stop the server');
     });
