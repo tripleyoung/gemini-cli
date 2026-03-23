@@ -35,7 +35,6 @@ import {
   applyModelSelection,
   createAvailabilityContextProvider,
 } from '../availability/policyHelpers.js';
-import { LlmRole } from '../telemetry/types.js';
 
 const DEFAULT_MAX_ATTEMPTS = 5;
 

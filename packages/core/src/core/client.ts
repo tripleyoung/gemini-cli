@@ -77,7 +77,6 @@ import {
 } from '../config/models.js';
 import { partToString } from '../utils/partUtils.js';
 import { coreEvents, CoreEvent } from '../utils/events.js';
-import type { LlmRole } from '../telemetry/types.js';
 
 const MAX_TURNS = 100;
 

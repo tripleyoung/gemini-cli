@@ -18,8 +18,6 @@ import {
 import { ToolCallDecision } from './tool-call-decision.js';
 import { type ConversationRecord } from '../services/chatRecordingService.js';
 
-import type { LlmRole } from './types.js';
-
 export type UiEvent =
   | (ApiResponseEvent & { 'event.name': typeof EVENT_API_RESPONSE })
   | (ApiErrorEvent & { 'event.name': typeof EVENT_API_ERROR })

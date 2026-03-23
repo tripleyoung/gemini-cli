@@ -232,34 +232,6 @@ describe('isProModel', () => {
   });
 });
 
-describe('isPreviewModel', () => {
-  it('should return true for preview models', () => {
-    expect(isPreviewModel(PREVIEW_GEMINI_MODEL)).toBe(true);
-    expect(isPreviewModel(PREVIEW_GEMINI_3_1_MODEL)).toBe(true);
-    expect(isPreviewModel(PREVIEW_GEMINI_FLASH_MODEL)).toBe(true);
-    expect(isPreviewModel(PREVIEW_GEMINI_MODEL_AUTO)).toBe(true);
-  });
-
-  it('should return false for non-preview models', () => {
-    expect(isPreviewModel(DEFAULT_GEMINI_MODEL)).toBe(false);
-    expect(isPreviewModel('gemini-1.5-pro')).toBe(false);
-  });
-});
-
-describe('isProModel', () => {
-  it('should return true for models containing "pro"', () => {
-    expect(isProModel('gemini-3-pro-preview')).toBe(true);
-    expect(isProModel('gemini-2.5-pro')).toBe(true);
-    expect(isProModel('pro')).toBe(true);
-  });
-
-  it('should return false for models without "pro"', () => {
-    expect(isProModel('gemini-3-flash-preview')).toBe(false);
-    expect(isProModel('gemini-2.5-flash')).toBe(false);
-    expect(isProModel('auto')).toBe(false);
-  });
-});
-
 describe('isCustomModel', () => {
   it('should return true for models not starting with gemini-', () => {
     expect(isCustomModel('testing')).toBe(true);
